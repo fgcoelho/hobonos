@@ -4,7 +4,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "files": [
     "dist"
@@ -25,8 +25,7 @@
     "test": "vitest run",
     "checktypes": "tsgo --noEmit",
     "dev": "tsdown --watch",
-    "build": "tsdown",
-    "bundlesize": "pnpm build && npm pack --dry-run"
+    "build": "tsdown"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.8",

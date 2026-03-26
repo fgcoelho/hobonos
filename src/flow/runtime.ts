@@ -7,15 +7,16 @@ import type {
   FlowAction,
   FlowActionContext,
   FlowActionRef,
+  FlowAuthoringApi,
   FlowBehaviorHandle,
   FlowBehaviorRegistry,
-  FlowChatApi,
   FlowChatConfig,
   FlowGuard,
   FlowGuardRef,
   FlowSideEffect,
   FlowSideEffectContext,
   FlowSideEffectRef,
+  FlowWorkerApi,
   IFlowChat,
   IntentRouteDefinition,
   NavigationState,
@@ -738,177 +739,196 @@ export const createFlowChat = <
   Helpers extends IChatHelpers,
 >(
   config: FlowChatConfig<Chat, ReceivedMessage, ParsedReceivedMessage, Helpers>,
-): FlowChatApi<ReceivedMessage, ParsedReceivedMessage, Chat, Helpers> => {
-  const flowsById = new Map<
-    string,
-    DefinedFlow<Chat, ParsedReceivedMessage, Helpers>
-  >();
+): FlowAuthoringApi<ReceivedMessage, ParsedReceivedMessage, Chat, Helpers> => {
   const registry = createBehaviorRegistry<Chat, ParsedReceivedMessage, Helpers>(
     config,
   );
 
-  const handle = async (chatId: string, payload: ReceivedMessage) => {
-    const chatRecord = await config.repository.retrieveChat(chatId);
+  return {
+    flow(id) {
+      return defineFlow<Chat, ParsedReceivedMessage, Helpers>(id);
+    },
+    createWorker(flows) {
+      const flowsById = new Map<
+        string,
+        DefinedFlow<Chat, ParsedReceivedMessage, Helpers>
+      >();
 
-    if (!chatRecord) {
-      throw new Error("Chat record not found");
-    }
+      for (const flow of flows) {
+        if (flowsById.has(flow.id)) {
+          throw new Error(`Duplicate flow '${flow.id}'`);
+        }
 
-    const chat = normalizeFlowState(
-      new Proxy(chatRecord, {
-        get: Reflect.get,
-        set: Reflect.set,
-      }) as Chat,
-    );
+        flowsById.set(flow.id, flow);
+      }
 
-    const flow = flowsById.get(chat.flow);
-    if (!flow) {
-      throw new Error("Flow not found");
-    }
+      const run: FlowWorkerApi<
+        ReceivedMessage,
+        ParsedReceivedMessage,
+        Chat,
+        Helpers
+      >["run"] = async (chatId, payload) => {
+        const chatRecord = await config.repository.retrieveChat(chatId);
 
-    const machine = createFlowMachine(flow);
+        if (!chatRecord) {
+          throw new Error("Chat record not found");
+        }
 
-    if (chat.flow_status === "ended") {
-      chat.flow_status = "active";
-      chat.current_step = null;
-      chat.current_branch = null;
-      chat.flow_snapshot = undefined;
-    }
+        const chat = normalizeFlowState(
+          new Proxy(chatRecord, {
+            get: Reflect.get,
+            set: Reflect.set,
+          }) as Chat,
+        );
 
-    const actor = createActor(
-      machine,
-      chat.flow_snapshot
-        ? { snapshot: chat.flow_snapshot as never }
-        : undefined,
-    ).start();
+        const flow = flowsById.get(chat.flow);
+        if (!flow) {
+          throw new Error("Flow not found");
+        }
 
-    const message = config.parseMessage(payload);
-    const helpers = config.helpers({ chat, message });
+        const machine = createFlowMachine(flow);
 
-    if (config.middleware) {
-      await config.middleware({ chat, message, helpers });
-    }
+        if (chat.flow_status === "ended") {
+          chat.flow_status = "active";
+          chat.current_step = null;
+          chat.current_branch = null;
+          chat.flow_snapshot = undefined;
+        }
 
-    const currentStepId = chat.current_step ?? flow.startStepId;
-    const currentStep = flow.steps[currentStepId];
-    if (!currentStep) {
-      throw new Error(`Flow step '${currentStepId}' not found`);
-    }
+        const actor = createActor(
+          machine,
+          chat.flow_snapshot
+            ? { snapshot: chat.flow_snapshot as never }
+            : undefined,
+        ).start();
 
-    if (chat.flow_history?.length === 0) {
-      chat.flow_history.push({
-        step: currentStepId,
-        at: new Date(),
-        reason: "start",
-      });
-    }
+        const message = config.parseMessage(payload);
+        const helpers = config.helpers({ chat, message });
 
-    const allowScopedGlobals = canUseGlobalIntents(flow, currentStepId);
-    const globalRoutes = flow.globalIntentRoutes.filter(
-      (route) => route.policy === "always" || allowScopedGlobals,
-    );
+        if (config.middleware) {
+          await config.middleware({ chat, message, helpers });
+        }
 
-    const globalHandled = await runIntentRoutes({
-      routes: globalRoutes,
-      scope: "global",
-      flow,
-      chat,
-      message,
-      helpers,
-      actor,
-      stepId: currentStepId,
-      config,
-      registry,
-    });
+        const currentStepId = chat.current_step ?? flow.startStepId;
+        const currentStep = flow.steps[currentStepId];
+        if (!currentStep) {
+          throw new Error(`Flow step '${currentStepId}' not found`);
+        }
 
-    if (!globalHandled) {
-      const stepHandled = await runIntentRoutes({
-        routes: currentStep.intentRoutes,
-        scope: "step",
-        flow,
-        chat,
-        message,
-        helpers,
-        actor,
-        stepId: currentStepId,
-        config,
-        registry,
-      });
+        if (chat.flow_history?.length === 0) {
+          chat.flow_history.push({
+            step: currentStepId,
+            at: new Date(),
+            reason: "start",
+          });
+        }
 
-      if (!stepHandled) {
-        const answerHandled = await runAnswerRoutes({
-          step: currentStep,
+        const allowScopedGlobals = canUseGlobalIntents(flow, currentStepId);
+        const globalRoutes = flow.globalIntentRoutes.filter(
+          (route) => route.policy === "always" || allowScopedGlobals,
+        );
+
+        const globalHandled = await runIntentRoutes({
+          routes: globalRoutes,
+          scope: "global",
           flow,
           chat,
           message,
           helpers,
           actor,
+          stepId: currentStepId,
           config,
           registry,
         });
 
-        if (!answerHandled) {
-          const fallbackHandled = await runFallback({
-            action: currentStep.otherwise,
+        if (!globalHandled) {
+          const stepHandled = await runIntentRoutes({
+            routes: currentStep.intentRoutes,
+            scope: "step",
             flow,
             chat,
             message,
             helpers,
             actor,
-            stepId: currentStep.id,
-            branchId: currentStep.branchId,
+            stepId: currentStepId,
+            config,
             registry,
           });
 
-          if (!fallbackHandled) {
-            await runFallback({
-              action: flow.otherwise,
+          if (!stepHandled) {
+            const answerHandled = await runAnswerRoutes({
+              step: currentStep,
               flow,
               chat,
               message,
               helpers,
               actor,
-              stepId: currentStep.id,
-              branchId: currentStep.branchId,
+              config,
               registry,
             });
+
+            if (!answerHandled) {
+              const fallbackHandled = await runFallback({
+                action: currentStep.otherwise,
+                flow,
+                chat,
+                message,
+                helpers,
+                actor,
+                stepId: currentStep.id,
+                branchId: currentStep.branchId,
+                registry,
+              });
+
+              if (!fallbackHandled) {
+                await runFallback({
+                  action: flow.otherwise,
+                  flow,
+                  chat,
+                  message,
+                  helpers,
+                  actor,
+                  stepId: currentStep.id,
+                  branchId: currentStep.branchId,
+                  registry,
+                });
+              }
+            }
           }
         }
-      }
-    }
 
-    if (chat.flow === flow.id) {
-      syncChatFromActor({ chat, flow, actor });
-    } else {
-      chat.current_step = null;
-      chat.current_branch = null;
-      chat.flow_status = "active";
-      chat.flow_snapshot = undefined;
-    }
+        if (chat.flow === flow.id) {
+          syncChatFromActor({ chat, flow, actor });
+        } else {
+          chat.current_step = null;
+          chat.current_branch = null;
+          chat.flow_status = "active";
+          chat.flow_snapshot = undefined;
+        }
 
-    if (
-      actor.getSnapshot().status === "done" &&
-      (chat.flow_stack?.length ?? 0) > 0
-    ) {
-      resumeParentFlow({
-        chat,
-        flowsById,
-      });
-    }
+        if (
+          actor.getSnapshot().status === "done" &&
+          (chat.flow_stack?.length ?? 0) > 0
+        ) {
+          resumeParentFlow({
+            chat,
+            flowsById,
+          });
+        }
 
-    actor.stop();
+        actor.stop();
 
-    const { id: _, ...rest } = chat;
-    await config.repository.updateChat(rest);
-  };
+        const { id: _, ...rest } = chat;
+        await config.repository.updateChat(rest);
+      };
 
-  return {
-    flow(id) {
-      return defineFlow<Chat, ParsedReceivedMessage, Helpers>(id, (flow) => {
-        flowsById.set(flow.id, flow);
-      });
+      return {
+        run,
+        flows() {
+          return Array.from(flowsById.values());
+        },
+      };
     },
-    handle,
     guard(id, guard) {
       registry.guards[id] = guard;
       return { kind: "guard", id } as const;
@@ -924,9 +944,6 @@ export const createFlowChat = <
     matcher(id, matcher) {
       registry.matchers[id] = matcher;
       return { kind: "matcher", id } as const;
-    },
-    flows() {
-      return Array.from(flowsById.values());
     },
   };
 };

@@ -111,6 +111,9 @@ export const createHarness = (options?: {
 
   return {
     chat,
+    createWorker(flows: Parameters<typeof chat.createWorker>[0]) {
+      return chat.createWorker(flows);
+    },
     chats,
     parseCalls,
     helperCalls,

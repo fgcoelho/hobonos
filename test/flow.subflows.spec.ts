@@ -3,7 +3,7 @@ import { createHarness } from "./helpers";
 
 describe("flow subflows", () => {
   it("enters a child flow, resets child data, and resumes the parent at returnTo", async () => {
-    const { chat, getChat } = createHarness();
+    const { chat, createWorker, getChat } = createHarness();
 
     const child = chat
       .flow("child")
@@ -15,7 +15,7 @@ describe("flow subflows", () => {
       )
       .build();
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) =>
         step.onIntent("begin", async ({ data, goto }) => {
@@ -27,7 +27,9 @@ describe("flow subflows", () => {
       .step("after", (step) => step.end())
       .build();
 
-    await chat.handle("chat_1", { text: "begin" });
+    const worker = createWorker([mainFlow, child]);
+
+    await worker.run("chat_1", { text: "begin" });
     expect(getChat().flow).toBe("child");
     expect(getChat().flow_stack).toEqual([
       {
@@ -38,7 +40,7 @@ describe("flow subflows", () => {
     ]);
     expect(getChat().flow_data).toEqual({});
 
-    await chat.handle("chat_1", { text: "anything" });
+    await worker.run("chat_1", { text: "anything" });
     expect(getChat().flow).toBe("main");
     expect(getChat().current_step).toBe("after");
     expect(getChat().flow_stack).toEqual([]);
@@ -46,7 +48,7 @@ describe("flow subflows", () => {
   });
 
   it("supports full handoff with returnTo null and nested subflow resume", async () => {
-    const { chat, getChat } = createHarness();
+    const { chat, createWorker, getChat } = createHarness();
 
     const grandchild = chat
       .flow("grandchild")
@@ -60,13 +62,15 @@ describe("flow subflows", () => {
       .step("done", (step) => step.end())
       .build();
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) => step.onIntent("begin", "handoff"))
       .step("handoff", (step) => step.subflow(child, { returnTo: null }))
       .build();
 
-    await chat.handle("chat_1", { text: "begin" });
+    const worker = createWorker([mainFlow, child, grandchild]);
+
+    await worker.run("chat_1", { text: "begin" });
     expect(getChat().flow).toBe("child");
     expect(getChat().flow_stack).toEqual([
       {
@@ -76,7 +80,7 @@ describe("flow subflows", () => {
       },
     ]);
 
-    await chat.handle("chat_1", { text: "deeper" });
+    await worker.run("chat_1", { text: "deeper" });
     expect(getChat().flow).toBe("grandchild");
     expect(getChat().flow_stack).toEqual([
       {
@@ -91,11 +95,11 @@ describe("flow subflows", () => {
       },
     ]);
 
-    await chat.handle("chat_1", { text: "finish-grandchild" });
+    await worker.run("chat_1", { text: "finish-grandchild" });
     expect(getChat().flow).toBe("child");
     expect(getChat().current_step).toBe("done");
 
-    await chat.handle("chat_1", { text: "finish-child" });
+    await worker.run("chat_1", { text: "finish-child" });
     expect(getChat().flow).toBe("main");
     expect(getChat().current_step).toBeNull();
     expect(getChat().flow_stack).toEqual([]);

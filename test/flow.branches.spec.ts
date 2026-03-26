@@ -3,9 +3,9 @@ import { createHarness } from "./helpers";
 
 describe("flow branches", () => {
   it("blocks respectBranch globals inside locked branches but allows always globals", async () => {
-    const { chat, getChat } = createHarness();
+    const { chat, createWorker, getChat } = createHarness();
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) => step.onIntent("begin", "inside"))
       .globalIntent("support", "support", { policy: "respectBranch" })
@@ -22,23 +22,25 @@ describe("flow branches", () => {
       .step("cancelled", (step) => step.end())
       .build();
 
-    await chat.handle("chat_1", { text: "begin" });
+    const worker = createWorker([mainFlow]);
+
+    await worker.run("chat_1", { text: "begin" });
     expect(getChat().current_step).toBe("inside");
     expect(getChat().current_branch).toBe("locked");
 
-    await chat.handle("chat_1", { text: "support" });
+    await worker.run("chat_1", { text: "support" });
     expect(getChat().current_step).toBe("inside");
     expect(getChat().store.transcript).toEqual(["inside-fallback"]);
 
-    await chat.handle("chat_1", { text: "cancel" });
+    await worker.run("chat_1", { text: "cancel" });
     expect(getChat().current_step).toBe("cancelled");
     expect(getChat().current_branch).toBeNull();
   });
 
   it("uses canExit to keep users inside a branch", async () => {
-    const { chat, getChat } = createHarness();
+    const { chat, createWorker, getChat } = createHarness();
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) => step.onIntent("begin", "inside"))
       .branch(
@@ -57,8 +59,10 @@ describe("flow branches", () => {
       .step("outside", (step) => step.end())
       .build();
 
-    await chat.handle("chat_1", { text: "begin" });
-    await chat.handle("chat_1", { text: "leave" });
+    const worker = createWorker([mainFlow]);
+
+    await worker.run("chat_1", { text: "begin" });
+    await worker.run("chat_1", { text: "leave" });
 
     expect(getChat().current_step).toBe("inside");
     expect(getChat().current_branch).toBe("locked");

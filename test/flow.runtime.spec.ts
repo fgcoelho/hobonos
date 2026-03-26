@@ -6,15 +6,21 @@ import { createChatRecord, createHarness } from "./helpers";
 describe("flow runtime", () => {
   it("normalizes flow state, runs middleware, and persists updates", async () => {
     const order: string[] = [];
-    const { chat, getChat, parseCalls, helperCalls, updateCalls } =
-      createHarness({
-        middleware: async ({ helpers }) => {
-          order.push("middleware");
-          await helpers.mark("middleware");
-        },
-      });
+    const {
+      chat,
+      createWorker,
+      getChat,
+      parseCalls,
+      helperCalls,
+      updateCalls,
+    } = createHarness({
+      middleware: async ({ helpers }) => {
+        order.push("middleware");
+        await helpers.mark("middleware");
+      },
+    });
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) =>
         step.otherwise(async ({ helpers, stay }) => {
@@ -25,7 +31,9 @@ describe("flow runtime", () => {
       )
       .build();
 
-    await chat.handle("chat_1", { text: "hello" });
+    const worker = createWorker([mainFlow]);
+
+    await worker.run("chat_1", { text: "hello" });
 
     const persisted = getChat();
     expect(parseCalls).toEqual(["hello"]);
@@ -46,7 +54,7 @@ describe("flow runtime", () => {
   });
 
   it("applies routing precedence of global intent, step intent, answer, then fallback", async () => {
-    const { chat, chats } = createHarness({
+    const { chat, chats, createWorker } = createHarness({
       chats: [createChatRecord()],
       matchIntent: ({ message, intents }) => {
         const normalized = message.text.trim().toLowerCase();
@@ -58,7 +66,7 @@ describe("flow runtime", () => {
     chats.set("answer", createChatRecord({ id: "answer" }));
     chats.set("fallback", createChatRecord({ id: "fallback" }));
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) =>
         step
@@ -91,9 +99,11 @@ describe("flow runtime", () => {
       .step("fallback_target", (step) => step.end())
       .build();
 
-    await chat.handle("global", { text: "go" });
-    await chat.handle("answer", { text: "answer" });
-    await chat.handle("fallback", { text: "unknown" });
+    const worker = createWorker([mainFlow]);
+
+    await worker.run("global", { text: "go" });
+    await worker.run("answer", { text: "answer" });
+    await worker.run("fallback", { text: "unknown" });
 
     expect(chats.get("global")?.store.transcript).toEqual(["global"]);
     expect(chats.get("global")?.current_step).toBe("global_target");
@@ -105,7 +115,7 @@ describe("flow runtime", () => {
   });
 
   it("resolves named behaviors and preserves effect/action ordering", async () => {
-    const { chat, getChat } = createHarness();
+    const { chat, createWorker, getChat } = createHarness();
 
     const enterGuard = chat.guard("enterGuard", async ({ data }) => {
       data.allowed = true;
@@ -133,7 +143,7 @@ describe("flow runtime", () => {
       async ({ message }) => message.text.length > 0,
     );
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) =>
         step
@@ -151,7 +161,9 @@ describe("flow runtime", () => {
       )
       .build();
 
-    await chat.handle("chat_1", { text: "Ada" });
+    const worker = createWorker([mainFlow]);
+
+    await worker.run("chat_1", { text: "Ada" });
 
     const persisted = getChat();
     expect(persisted.flow_data).toMatchObject({
@@ -172,9 +184,9 @@ describe("flow runtime", () => {
   });
 
   it("supports repeat, stay, ended-flow restart, and missing chat/flow errors", async () => {
-    const { chat, chats, getChat } = createHarness();
+    const { chat, chats, createWorker, getChat } = createHarness();
 
-    chat
+    const mainFlow = chat
       .flow("main")
       .start((step) =>
         step.otherwise(async ({ message, helpers, repeat, stay, end }) => {
@@ -195,23 +207,25 @@ describe("flow runtime", () => {
       )
       .build();
 
-    await chat.handle("chat_1", { text: "repeat" });
+    const worker = createWorker([mainFlow]);
+
+    await worker.run("chat_1", { text: "repeat" });
     expect(getChat().store.transcript).toEqual(["repeat"]);
     expect(getChat().flow_history).toHaveLength(1);
 
-    await chat.handle("chat_1", { text: "stay" });
+    await worker.run("chat_1", { text: "stay" });
     expect(getChat().store.transcript).toEqual(["repeat", "stay"]);
     expect(getChat().current_step).toBe("__start__");
 
-    await chat.handle("chat_1", { text: "end" });
+    await worker.run("chat_1", { text: "end" });
     expect(getChat().flow_status).toBe("ended");
     expect(getChat().current_step).toBeNull();
 
-    await chat.handle("chat_1", { text: "stay" });
+    await worker.run("chat_1", { text: "stay" });
     expect(getChat().flow_status).toBe("active");
     expect(getChat().current_step).toBe("__start__");
 
-    await expect(chat.handle("missing", { text: "hello" })).rejects.toThrow(
+    await expect(worker.run("missing", { text: "hello" })).rejects.toThrow(
       "Chat record not found",
     );
 
@@ -224,8 +238,25 @@ describe("flow runtime", () => {
       store: { transcript: [], calls: [] },
     });
 
-    await expect(chat.handle("broken", { text: "hello" })).rejects.toThrow(
+    await expect(worker.run("broken", { text: "hello" })).rejects.toThrow(
       "Flow not found",
+    );
+  });
+
+  it("throws when a worker is created with duplicate flow ids", () => {
+    const { chat, createWorker } = createHarness();
+
+    const duplicateA = chat
+      .flow("main")
+      .start((step) => step.end())
+      .build();
+    const duplicateB = chat
+      .flow("main")
+      .start((step) => step.end())
+      .build();
+
+    expect(() => createWorker([duplicateA, duplicateB])).toThrow(
+      "Duplicate flow 'main'",
     );
   });
 });

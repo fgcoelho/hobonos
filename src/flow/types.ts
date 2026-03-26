@@ -443,14 +443,16 @@ export interface FlowChatConfig<
   }) => Promisable<void>;
 }
 
-export type FlowChatApi<
+export type FlowAuthoringApi<
   ReceivedMessage,
   ParsedReceivedMessage,
   Chat extends IFlowChat,
   Helpers extends IChatHelpers,
 > = {
   flow: (id: string) => FlowBuilder<Chat, ParsedReceivedMessage, Helpers>;
-  handle: (chatId: string, payload: ReceivedMessage) => Promise<void>;
+  createWorker: (
+    flows: DefinedFlow<Chat, ParsedReceivedMessage, Helpers>[],
+  ) => FlowWorkerApi<ReceivedMessage, ParsedReceivedMessage, Chat, Helpers>;
   guard: (
     id: string,
     guard: FlowGuard<Chat, ParsedReceivedMessage, Helpers>,
@@ -467,6 +469,15 @@ export type FlowChatApi<
     id: string,
     matcher: MessageMatcher<Chat, ParsedReceivedMessage, Helpers, any>,
   ) => FlowBehaviorHandle<"matcher">;
+};
+
+export type FlowWorkerApi<
+  ReceivedMessage,
+  ParsedReceivedMessage,
+  Chat extends IFlowChat,
+  Helpers extends IChatHelpers,
+> = {
+  run: (chatId: string, payload: ReceivedMessage) => Promise<void>;
   flows: () => DefinedFlow<Chat, ParsedReceivedMessage, Helpers>[];
 };
 

@@ -1,6 +1,6 @@
 # hobonos, build websites through messages.
 
-`hobonos` is a flow-first engine for products where the user experience is driven by chat. You define flows as a graph of steps, branches, guards, actions, and side effects. Under the hood, the runtime persists flow state with XState snapshots.
+`hobonos` is a flow-first engine for products where the user experience is driven by chat. You define flows as a graph of steps, branches, guards, actions, and side effects. Under the hood, a worker persists flow state with XState snapshots.
 
 ## Install
 
@@ -18,9 +18,10 @@ pnpm add hobonos
 
 ## Core concepts
 
-- `createFlowChat(...)`: create the chat runtime and flow authoring surface
-- `chat.flow(...)`: build and register a flow graph
-- `chat.handle(...)`: process an incoming message for a persisted chat
+- `createFlowChat(...)`: create the flow authoring surface and worker factory
+- `chat.flow(...)`: build a flow graph definition
+- `chat.createWorker(...)`: create a worker from flow definitions
+- `chatWorker.run(...)`: process an incoming message for a persisted chat
 - `step`: the current node in the flow
 - `branch`: a grouped region that can control exits and interruptions
 - `guard`: decides whether a step or transition is allowed
@@ -41,7 +42,7 @@ type WebsiteChat = IFlowChat & {
 };
 ```
 
-Important flow fields managed by the runtime:
+Important flow fields managed by the worker:
 
 - `current_step`
 - `current_branch`
@@ -182,14 +183,16 @@ const website = chat
   })
   .build();
 
-await chat.handle("chat_123", { text: "register" });
+const worker = chat.createWorker([website, supportFlow]);
+
+await worker.run("chat_123", { text: "register" });
 ```
 
 ## Usage guides
 
 ### 1. Boot a chat session
 
-`chat.handle(...)` expects a persisted chat record to already exist. A simple in-memory setup is enough for local development and tests.
+`worker.run(...)` expects a persisted chat record to already exist. A simple in-memory setup is enough for local development and tests.
 
 ```ts
 import { createFlowChat, type IFlowChat } from "hobonos";
@@ -225,7 +228,7 @@ const chat = createFlowChat<Message, Message, Chat, { send: (text: string) => Pr
   },
 });
 
-chat
+const website = chat
   .flow("website")
   .start((step) =>
     step
@@ -243,6 +246,8 @@ chat
   )
   .build();
 
+const worker = chat.createWorker([website]);
+
 chats.chat_1 = {
   id: "chat_1",
   flow: "website",
@@ -254,7 +259,7 @@ chats.chat_1 = {
   },
 };
 
-await chat.handle("chat_1", { text: "pricing" });
+await worker.run("chat_1", { text: "pricing" });
 
 console.log(chats.chat_1?.store.transcript);
 ```
@@ -411,11 +416,11 @@ chat
   .build();
 ```
 
-After the handoff, the chat's `flow` field is updated to the child flow id, so the next `chat.handle(...)` call continues inside that routed flow.
+After the handoff, the chat's `flow` field is updated to the child flow id, so the next `worker.run(...)` call continues inside that routed flow.
 
 ### 6. Understand the message lifecycle
 
-For each `chat.handle(chatId, payload)` call, the runtime does this in order:
+For each `worker.run(chatId, payload)` call, the worker does this in order:
 
 - loads the persisted chat from your repository
 - parses the incoming payload with `parseMessage`
@@ -439,6 +444,8 @@ This ordering is useful when you are deciding whether something should be modele
 - `globalIntent(intentId, actionOrTarget, options?)`
 - `otherwise(action)`
 - `build()`
+
+`chat.flow(id)` is pure. It returns a builder, and `.build()` returns a `DefinedFlow` value with no registration side effects.
 
 ### Step
 
@@ -502,7 +509,7 @@ Subflows let one flow enter another flow cleanly.
 
 - use `step.subflow(childFlow, { returnTo })`
 - the parent flow is pushed onto `flow_stack`
-- when the child flow ends, the runtime resumes the parent flow on the configured return step
+- when the child flow ends, the worker resumes the parent flow on the configured return step
 
 This is useful for:
 
@@ -526,9 +533,9 @@ You still author flows with the `hobonos` flow DSL rather than raw XState config
 
 ## Runtime API
 
-- `chat.handle(chatId, payload)` processes a new incoming message
-- `chat.flows()` returns the registered flow definitions
-- `chat.flow(id)` creates and registers a flow when `.build()` is called
+- `chat.createWorker(flows)` creates a worker from explicit flow definitions
+- `worker.run(chatId, payload)` processes a new incoming message
+- `worker.flows()` returns the worker's flow definitions
 
 ## Current scope
 
