@@ -7,10 +7,6 @@ settings:
 importers:
 
   .:
-    dependencies:
-      xstate:
-        specifier: ^5.28.0
-        version: 5.28.0
     devDependencies:
       '@biomejs/biome':
         specifier: 2.4.8
@@ -990,9 +986,6 @@ packages:
     engines: {node: '>=8'}
     hasBin: true
 
-  xstate@5.28.0:
-    resolution: {integrity: sha512-Iaqq6ZrUzqeUtA3hC5LQKZfR8ZLzEFTImMHJM3jWEdVvXWdKvvVLXZEiNQWm3SCA9ZbEou/n5rcsna1wb9t28A==}
-
 snapshots:
 
   '@babel/generator@8.0.0-rc.2':
@@ -1697,5 +1690,3 @@ snapshots:
     dependencies:
       siginfo: 2.0.0
       stackback: 0.0.2
-
-  xstate@5.28.0: {}

@@ -1,6 +1,8 @@
 # hobonos, build websites through messages.
 
-`hobonos` is a flow-first engine for products where the user experience is driven by chat. You define flows as a graph of steps, branches, guards, actions, and side effects. Under the hood, a worker persists flow state with XState snapshots.
+`hobonos` is a conversational router. Routes own pages, pages own components, and each incoming message resolves to the component the user is trying to interact with.
+
+It is inspired by prompt libraries like `@inquirer/prompts`, but it is built for persistent chat state, route navigation, and component resolution across a conversational UI.
 
 ## Install
 
@@ -8,552 +10,558 @@
 pnpm add hobonos
 ```
 
-## Philosophy
+## Mental Model
 
-- Flows are graphs, not loose handlers
-- Branches can be interruptible or locked
-- Global intents like `support` or `cancel` should work everywhere you allow them
-- Side effects should be explicit and localized
-- Runtime state should be durable and resumable
+- a route owns one `page`
+- a page exposes `components: []`
+- each component has a `label` used for matching and guidance
+- your app sends actual user-facing copy with `ctx.send(...)` or helpers from middleware
+- some components act immediately, others focus and wait for the next reply
+- `help` is the fallback component for current-component resolution failures
+- `notFound` is for invalid route resolution
 
-## Core concepts
+## Core API
 
-- `createFlowChat(...)`: create the flow authoring surface and worker factory
-- `chat.flow(...)`: build a flow graph definition
-- `chat.createWorker(...)`: create a worker from flow definitions
-- `chatWorker.run(...)`: process an incoming message for a persisted chat
-- `step`: the current node in the flow
-- `branch`: a grouped region that can control exits and interruptions
-- `guard`: decides whether a step or transition is allowed
-- `action`: can mutate data and navigate with `goto`, `end`, `repeat`, `stay`
-- `effect`: side effect without navigation intent
+- `createHobonos({ parseMessage, repository, resolveComponent, defaultFocusDuration? })`
+- `.middleware(async ({ chat, message, ctx }) => ({ ctx: { ... } }))`
+- `hobonos.route(name, { routes?, layout?, page?, middleware?, notFound? })`
+- `hobonos.rootRoute({ routes?, layout?, page?, middleware?, notFound? })`
+- `hobonos.layout({ render?, components? })`
+- `hobonos.page({ render?, components? })`
+- `hobonos.text(id, options)`
+- `hobonos.button(id, options)`
+- `hobonos.input(id, options)`
+- `hobonos.inquiry(id, options)`
+- `hobonos.back(options)`
+- `hobonos.help({ render })`
 
-## Chat shape
+Route-local `middleware` and `notFound` are configured directly on `route(..., { ... })`.
 
-Your persisted chat entity should extend `IFlowChat`.
+Create workers with the branded app root only:
 
 ```ts
-import type { IFlowChat } from "hobonos";
-
-type WebsiteChat = IFlowChat & {
-  store: {
-    userId?: string;
-  };
-};
+const root = hobonos.rootRoute({ routes: [support] });
+const worker = hobonos.createWorker(root);
 ```
 
-Important flow fields managed by the worker:
+## Chat
 
-- `current_step`
-- `current_branch`
-- `flow_status`
-- `flow_data`
-- `flow_history`
-- `flow_snapshot`
+There is only one chat model: `IChat`.
 
-## Example
+Managed fields:
+
+- `currentRouteId`
+- `storage`
+- `history`
+- `focusedComponentId`
+- `focusUntil`
+- `inquiries`
+
+## End-To-End Example
 
 ```ts
-import { createFlowChat, type IFlowChat } from "hobonos";
+import ai from "ai";
+import { createHobonos, type IChat } from "hobonos";
 
-type Message = {
-  text: string;
+type Message = { text: string };
+type ChatStorage = {
+  transcript: string[];
+  email?: string;
+  signup?: Record<string, unknown>;
 };
 
-type Chat = IFlowChat;
+type Chat = IChat<ChatStorage>;
 
-type Helpers = {
-  send: (text: string) => Promise<void>;
-};
-
-const chat = createFlowChat<unknown, Message, Chat, Helpers>({
-  parseMessage: (payload) => payload as Message,
+const hobonos = createHobonos<Message, Message, Chat>({
+  parseMessage: (payload) => payload,
   repository: {
     retrieveChat: async (chatId) => db.get(chatId),
     updateChat: async (chat) => db.set(chat.id, chat),
   },
-  helpers: ({ chat, message }) => ({
-    send: async (text) => sendMessage(chat.id, text, message),
+  resolveComponent: async ({ message, components }) => {
+    const decision = await ai.generateObject({
+      prompt: [
+        "Pick the visible component the user is trying to use.",
+        JSON.stringify({
+          message: message.text,
+          components: components.map((component) => ({
+            id: component.id,
+            label: component.label,
+            examples: component.examples ?? [],
+          })),
+        }),
+      ].join("\n"),
+      schema: {
+        componentId: "string | null",
+        input: "string | undefined",
+      },
+    });
+
+    if (!decision.object.componentId) return null;
+
+    return {
+      id: decision.object.componentId,
+      input: decision.object.input,
+    };
+  },
+})
+  .middleware(async ({ chat }) => ({
+    ctx: {
+      send: async (text: string) => {
+        chat.storage.transcript.push(text);
+      },
+    },
+  }));
+
+const plans = hobonos.route("plans", {
+  page: hobonos.page({
+    render: async ({ ctx }) => {
+      await ctx.send("Plans page");
+    },
+    components: [
+      hobonos.text("pricingInfo", {
+        label: "Pricing info",
+        examples: ["plans"],
+        render: async ({ ctx }) => {
+          await ctx.send("We offer Starter, Pro, and Enterprise.");
+        },
+      }),
+      hobonos.back({}),
+    ],
   }),
-  matchIntent: async ({ message, intents }) => {
-    const text = message.text.toLowerCase();
-    return intents.find((intent) => text.includes(intent.id))?.id ?? null;
+});
+
+const support = hobonos.rootRoute({
+  routes: [plans],
+  page: hobonos.page({
+    render: async ({ ctx }) => {
+      await ctx.send("Support home");
+    },
+    components: [
+      hobonos.button("plans", {
+        label: "Pricing",
+        examples: ["pricing"],
+        onInteract: ({ navigate }) => {
+          navigate(plans);
+        },
+      }),
+      hobonos.input("email", {
+        label: "Email",
+        examples: ["share email"],
+        render: async ({ ctx }) => {
+          await ctx.send("What is your email?");
+        },
+        onInteract: async ({ input, message, storage, ctx }) => {
+          storage.email = (input ?? message.text).trim();
+          await ctx.send("Saved.");
+        },
+      }),
+      hobonos.help({
+        render: async ({ ctx, components }) => {
+          await ctx.send(
+            `Try one of: ${components.map((component) => component.label).join(", ")}`,
+          );
+        },
+      }),
+    ],
+  }),
+});
+```
+
+## How Interaction Works
+
+1. your app receives a raw payload
+2. `parseMessage` normalizes it
+3. on the very first user message, hobonos renders the current page and stops there
+4. `resolveComponent` receives the currently visible components
+5. the matched component runs, or an `input` can receive direct `input` from the resolver
+6. focused components store focus and handle the next reply
+7. focused components can optionally set `focusUntil` from `focusDuration`
+8. `navigate(...)` changes route and clears focus
+
+Use `hobonos.rootRoute(...)` for the app root instead of writing `route("")` directly. `createWorker(...)` requires that branded root route.
+
+Route ids are absolute paths like `/` or `/plans`.
+
+Component ids are `routeId:name`, like `/:email` or `/support:email`.
+
+Route names and component names must contain only letters and numbers.
+
+Visible components include:
+
+- layout components from root to leaf
+- the current page's components
+- canonical built-ins like `back` and `help` when you include them in `components: []`
+
+## Middleware Context
+
+`createHobonos()` returns the app directly. Middleware extends `ctx`.
+
+```ts
+const hobonos = createHobonos({
+  parseMessage,
+  repository,
+  resolveComponent,
+})
+  .middleware(async () => ({
+    ctx: {
+      db,
+    },
+  }))
+  .middleware(async ({ ctx }) => ({
+    ctx: {
+      ...ctx,
+      send,
+    },
+  }));
+```
+
+Everything returned in `ctx` is available in route middleware, page render handlers, and component handlers.
+
+## Component Guide
+
+Pages expose `components: []`.
+
+- `text`: non-focused content component
+- `button`: immediate component with `onInteract`
+- `input`: focused free-text component
+- `inquiry`: focused multi-step component built by composing `input`
+- `back`: navigation component that lives in `components: []`
+- `help`: fallback component that also lives in `components: []`
+
+`label` identifies the component. It is not the text automatically sent to the user. Sending copy is your app's job.
+
+`storage` is the single end-user state bag on `chat`. Use it for transcript state, temporary values, or persisted flow answers.
+
+Routes are nested directly with `route(..., { routes: [...] })`. There is no `parent` option or `routes()` helper.
+
+### text
+
+Use `text` for displayable content that does not focus and does not take an action.
+
+```ts
+hobonos.text("hours", {
+  label: "Business hours",
+  examples: ["hours"],
+  render: async ({ ctx }) => {
+    await ctx.send("We are open Monday to Friday, 9am to 6pm.");
   },
 });
+```
 
-const nonEmpty = chat.matcher("nonEmpty", async ({ message }) => {
-  return message.text.trim().length > 0;
+`text` also participates in `resolveComponent`, so users can explicitly ask for it.
+
+### button
+
+Use `button` for immediate actions.
+
+```ts
+hobonos.button("pricing", {
+  label: "Pricing",
+  onInteract: ({ navigate }) => {
+    navigate(plans);
+  },
 });
+```
 
-const email = chat.matcher("email", async ({ message }) => {
-  return /.+@.+\..+/.test(message.text.trim());
+- `button` never focuses
+- if a button should navigate, call `navigate(...)` inside `onInteract`
+
+### input
+
+Use `input` for free text.
+
+```ts
+hobonos.input("email", {
+  label: "Email",
+  render: async ({ ctx }) => {
+    await ctx.send("What is your email?");
+  },
+  onInteract: async ({ input, message, storage }) => {
+    storage.email = (input ?? message.text).trim();
+  },
 });
+```
 
-const announceRegistration = chat.effect("announceRegistration", async ({ helpers }) => {
-  await helpers.send("Let's create your account.");
+`input` focuses and forwards the next raw reply to `onInteract`.
+
+`resolveComponent` can also return `{ id, input }` for an `input` component when the user already provided the value in the same message.
+
+Use `unfocus()` inside `onInteract` when you want to stop the current focused flow without navigating:
+
+```ts
+hobonos.input("email", {
+  label: "Email",
+  render: async ({ ctx }) => {
+    await ctx.send("What is your email?");
+  },
+  onInteract: async ({ input, message, ctx, unfocus }) => {
+    const email = input ?? message.text;
+    if (email.trim().toLowerCase() === "cancel") {
+      unfocus();
+      await ctx.send("Okay, cancelled.");
+      return;
+    }
+
+    await ctx.send("Saved.");
+  },
 });
+```
 
-const hasName = chat.guard("hasName", async ({ data }) => Boolean(data.name));
+### inquiry
 
-const saveEmail = chat.action("saveEmail", async ({ message, data, goto }) => {
-  data.email = message.text.trim();
-  goto("done");
-});
+Use `inquiry` when a single component should drive a multi-step prompt flow with multiple `input` steps.
 
-const supportFlow = chat
-  .flow("support")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("A human will reach out shortly.");
-      })
-      .end(),
-  )
-  .build();
-
-const website = chat
-  .flow("website")
-  .start((step) =>
-    step
-      .onIntent("register", "ask_name")
-      .onIntent("pricing", "pricing")
-      .onIntent("support", "support"),
-  )
-  .globalIntent("support", "support", { policy: "always" })
-  .branch(
-    "registration",
-    {
-      allowExternalIntents: false,
-      canExit: ({ toStepId }) => toStepId === "done",
-    },
-    (branch) =>
-      branch
-        .step("ask_name", (step) =>
-          step
-            .effect(announceRegistration)
-            .prompt(async ({ helpers }) => {
-              await helpers.send("What is your name?");
-            })
-            .onAnswer(
-              nonEmpty,
-              async ({ message, data, goto }) => {
-                data.name = message.text.trim();
-                goto("ask_email");
-              },
-            ),
-        )
-        .step("ask_email", (step) =>
-          step
-            .canEnter(hasName)
-            .prompt(async ({ helpers }) => {
-              await helpers.send("Now send me your email.");
-            })
-            .onAnswer(
-              email,
-              saveEmail,
-              {
-                effects: [async ({ helpers }) => helpers.send("Checking email...")],
-              },
-            )
-            .otherwise(async ({ helpers, repeat }) => {
-              await helpers.send("That doesn't look like an email.");
-              repeat();
-            }),
-        )
-        .step("done", (step) =>
-          step
-            .effect(async ({ helpers }) => {
-              await helpers.send("Registration complete.");
-            })
-            .end(),
-        ),
-  )
-  .step("pricing", (step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("We have Starter, Pro, and Enterprise plans.");
-      })
-      .end(),
-  )
-  .step("support", (step) =>
-    step.subflow(supportFlow, { returnTo: null })
-  )
-  .otherwise(async ({ helpers }) => {
-    await helpers.send("I didn't understand that yet.");
+```ts
+const signup = hobonos
+  .inquiry("signup", {
+    label: "Signup",
+    examples: ["signup"],
   })
-  .build();
-
-const worker = chat.createWorker([website, supportFlow]);
-
-await worker.run("chat_123", { text: "register" });
+  .input("email", {
+    label: "Email",
+    render: async ({ ctx }) => {
+      await ctx.send("What is your email?");
+    },
+  })
+  .input("plan", {
+    label: "Plan",
+    render: async ({ ctx }) => {
+      await ctx.send("Which plan do you want?");
+    },
+  })
+  .input("confirmation", {
+    label: "Confirmation",
+    render: async ({ ctx }) => {
+      await ctx.send("Type yes to continue.");
+    },
+  })
+  .submit(async ({ answers, ctx, storage }) => {
+    storage.signup = answers;
+    await ctx.send("Signed up.");
+  });
 ```
 
-## Usage guides
+`inquiry` behaves like a composed prompt flow:
 
-### 1. Boot a chat session
+- users resolve the inquiry by its outer `label`
+- once focused, each step runs in order
+- answers are collected by step id
+- `.submit(...)` runs after the final step
+- after `.submit(...)`, the inquiry leaves focus by default
+- navigation inside `.submit(...)` still clears focus
 
-`worker.run(...)` expects a persisted chat record to already exist. A simple in-memory setup is enough for local development and tests.
+### focusDuration and focusUntil
+
+Focusable components support `focusDuration` in milliseconds.
+
+You can also set `defaultFocusDuration` once at `createHobonos(...)`. Per-component `focusDuration` wins when present.
 
 ```ts
-import { createFlowChat, type IFlowChat } from "hobonos";
-
-type Message = { text: string };
-type Chat = IFlowChat & {
-  store: {
-    transcript: string[];
-  };
-};
-
-const chats: { chat_1?: Chat } = {};
-
-const chat = createFlowChat<Message, Message, Chat, { send: (text: string) => Promise<void> }>({
-  parseMessage: (payload) => payload,
-  repository: {
-    retrieveChat: async (chatId) => (chatId === "chat_1" ? chats.chat_1 ?? null : null),
-    updateChat: async (next) => {
-      chats.chat_1 = {
-        id: "chat_1",
-        ...next,
-      } as Chat;
-    },
-  },
-  helpers: ({ chat }) => ({
-    send: async (text) => {
-      chat.store.transcript.push(text);
-    },
-  }),
-  matchIntent: async ({ message, intents }) => {
-    const normalized = message.text.trim().toLowerCase();
-    return intents.find((intent) => intent.id === normalized)?.id ?? null;
+hobonos.input("email", {
+  label: "Email",
+  focusDuration: 120_000,
+  render: async ({ ctx }) => {
+    await ctx.send("What is your email?");
   },
 });
+```
 
-const website = chat
-  .flow("website")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Say pricing to continue.");
-      })
-      .onIntent("pricing", "pricing"),
-  )
-  .step("pricing", (step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Starter is $19/month.");
-      })
-      .end(),
-  )
-  .build();
+When a focused component has an effective duration, `chat.focusUntil` is set to `Date.now() + duration`.
 
-const worker = chat.createWorker([website]);
+If a new user message arrives after `Date.now() > chat.focusUntil`, hobonos clears the expired focused state before resolving that message.
 
-chats.chat_1 = {
-  id: "chat_1",
-  flow: "website",
-  language: "en",
-  locked: false,
-  lock_until: null,
-  store: {
-    transcript: [],
+If neither the component nor the app config provides a positive duration, `focusUntil` stays `null`.
+
+### back
+
+Use `back` as a regular component for backwards navigation.
+
+`hobonos.back(...)` always creates the same component metadata:
+
+- id segment: `back`
+- label: `Back`
+- examples: `["back", "go back"]`
+
+```ts
+hobonos.back({
+  render: async ({ ctx, breadcrumbs }) => {
+    await ctx.send(
+      `Where back? ${breadcrumbs.map((crumb) => crumb.label).join(", ")}`,
+    );
   },
-};
-
-await worker.run("chat_1", { text: "pricing" });
-
-console.log(chats.chat_1?.store.transcript);
+  onInteract: async ({ message, breadcrumbs, goBack }) => {
+    const crumb = breadcrumbs.find(
+      (entry) =>
+        entry.label.toLowerCase() === message.text.trim().toLowerCase(),
+    );
+    goBack(crumb);
+  },
+})
 ```
 
-### 2. Pass params into answer matchers
+Without a custom `onInteract`, `back` uses the previous breadcrumb by default.
 
-Use `onAnswer(matcher, params, action)` when the same matcher should be reused with different constraints.
+If `render` is present, selecting `back` focuses it first. Without `render`, selecting `back` immediately navigates to the previous breadcrumb.
+
+### help
+
+`help` is the fallback component for current-component resolution failures.
+
+`hobonos.help({ render })` always creates the same component metadata:
+
+- id segment: `help`
+- label: `Help`
+- examples: `["help"]`
+
+Use it when:
+
+- the current route is valid, but the current component cannot be resolved
+- a user message does not map to a component on the current route
+- a previously focused component cannot be recovered anymore
+
+It runs on a valid route. If the route itself cannot be resolved, use `notFound`.
+
+`help` is for recovery-level edge cases - the situations where the runtime would otherwise have to fail because it cannot determine the current component interaction safely.
 
 ```ts
-const minLength = chat.matcher(
-  "minLength",
-  async ({ message, params }) => message.text.trim().length >= (params as { size: number }).size,
-);
-
-chat
-  .flow("lead")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("What company do you work at?");
-      })
-      .onAnswer(minLength, { size: 3 }, async ({ message, data, goto }) => {
-        data.company = message.text.trim();
-        goto("done");
-      })
-      .otherwise(async ({ helpers, repeat }) => {
-        await helpers.send("Please send at least 3 characters.");
-        repeat();
-      }),
-  )
-  .step("done", (step) => step.end())
-  .build();
+hobonos.help({
+  render: async ({ ctx, components }) => {
+    await ctx.send(
+      `Try one of: ${components.map((component) => component.label).join(", ")}`,
+    );
+  },
+})
 ```
 
-### 3. Add cancel or support everywhere
+How `help` behaves:
 
-Global intents are the easiest way to keep escape hatches available across the whole flow.
+- it is fallback guidance, like a text component used only on failure
+- it receives visible components, so it can suggest labels/examples
+- page-level help components win first
+- if the page has no help component, the nearest ancestor layout help component can handle it
+
+## Layouts
+
+Layouts are cumulative from root to leaf.
+
+- layout renders run before the page render
+- layout components are visible to descendant routes
+- layout help components can recover interactions when a page does not define its own help
 
 ```ts
-chat
-  .flow("checkout")
-  .start((step) => step.onIntent("begin", "shipping"))
-  .globalIntent("cancel", async ({ helpers, end }) => {
-    await helpers.send("No problem - I cancelled the flow.");
-    end();
-  }, { policy: "always" })
-  .globalIntent("support", "human_handoff", { policy: "always" })
-  .step("shipping", (step) =>
-    step.prompt(async ({ helpers }) => {
-      await helpers.send("Where should we ship your order?");
-    }),
-  )
-  .step("human_handoff", (step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("A human will take over from here.");
-      })
-      .end(),
-  )
-  .build();
+const root = hobonos.rootRoute({
+  layout: hobonos.layout({
+    render: async ({ ctx }) => {
+      await ctx.send("Root layout");
+    },
+    components: [
+      hobonos.button("billing", {
+        label: "Billing",
+        onInteract: ({ navigate }) => {
+          navigate(billing);
+        },
+      }),
+    ],
+  }),
+  page: hobonos.page({ components: [] }),
+});
 ```
 
-Use `policy: "respectBranch"` when a locked branch should be allowed to block most global routes.
+## help vs notFound
 
-### 4. Reuse a verification flow with subflows
+Use `help` when the route is valid but the current component cannot be resolved.
 
-Subflows are useful when a step should hand off to another flow and then return to a known step in the parent.
+Use `notFound` when the current route cannot be resolved anymore.
 
 ```ts
-const verifyEmail = chat
-  .flow("verify_email")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Send the 6-digit code from your inbox.");
-      })
-      .onAnswer(async ({ message }) => /^\d{6}$/.test(message.text.trim()), async ({ goto }) => {
-        goto("verified");
-      }),
-  )
-  .step("verified", (step) => step.end())
-  .build();
-
-chat
-  .flow("signup")
-  .start((step) => step.onIntent("register", "verify"))
-  .step("verify", (step) => step.subflow(verifyEmail, { returnTo: "complete" }))
-  .step("complete", (step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Your account is verified and ready.");
-      })
-      .end(),
-  )
-  .build();
+const root = hobonos.rootRoute({
+  page: hobonos.page({ components: [] }),
+  notFound: hobonos.page({
+    render: async ({ ctx }) => {
+      await ctx.send("That route no longer exists.");
+    },
+  }),
+});
 ```
 
-When the child flow ends, `hobonos` pops the parent from `flow_stack` and resumes at `returnTo`.
+## Focus And Navigation
 
-### 5. Route between flows
+Focused components:
 
-If one flow should hand off to another, model the handoff as a subflow step. Use `returnTo: null` when you want the child flow to fully take over instead of resuming the parent.
+- `input`
+- `inquiry`
+- `back` when it has `render`
+
+Immediate components:
+
+- `text`
+- `button`
+
+Navigation rules:
+
+- `navigate(routeHandle)` changes route
+- route navigation clears focus
+- focused interactions stay on the current route unless they navigate
+- unresolved current-component edge cases fall back to `help`
+
+## Source Layout
+
+The codebase is organized around the route-centric conversation runtime now:
+
+- `src/conversation/api`: public builders like `createHobonos`
+- `src/conversation/contracts`: chat and repository contracts
+- `src/conversation/model`: routes, pages, components, handles, and public types
+- `src/conversation/runtime`: focus, navigation, rendering, route composition, and worker execution
+
+Public exports live in `src/exports/*`.
+
+Internal implementation lives in:
+
+- `src/conversation/*`
+- `src/shared/*`
+
+## Resolver Example
+
+`resolveComponent` chooses from the visible components on the current route. It can also return `{ id, input }` when the user both references an `input` component and already provides its value.
 
 ```ts
-const sales = chat
-  .flow("sales")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Tell me what you want to buy.");
-      })
-      .onIntent("support", "support_handoff")
-      .otherwise(async ({ helpers, repeat }) => {
-        await helpers.send("You can describe your order or say support.");
-        repeat();
-      }),
-  )
-  .build();
+import ai from "ai";
 
-const support = chat
-  .flow("support")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Support here. What do you need help with?");
-      })
-      .onIntent("billing", "billing")
-      .otherwise(async ({ helpers, repeat }) => {
-        await helpers.send("Say billing if you need account help.");
-        repeat();
+resolveComponent: async ({ message, components }) => {
+  const decision = await ai.generateObject({
+    prompt: [
+      "Choose the best visible component for this user message.",
+      "If the user already supplied a value for an input component, return it in input.",
+      JSON.stringify({
+        message: message.text,
+        components: components.map((component) => ({
+          id: component.id,
+          label: component.label,
+          examples: component.examples ?? [],
+        })),
       }),
-  )
-  .step("billing", (step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("I can help with invoices and payment failures.");
-      })
-      .end(),
-  )
-  .build();
+    ].join("\n"),
+    schema: {
+      componentId: "string | null",
+      input: "string | undefined",
+    },
+  });
 
-chat
-  .flow("router")
-  .start((step) =>
-    step
-      .prompt(async ({ helpers }) => {
-        await helpers.send("Say sales or support.");
-      })
-      .onIntent("sales", "to_sales")
-      .onIntent("support", "to_support"),
-  )
-  .step("to_sales", (step) => step.subflow(sales, { returnTo: null }))
-  .step("to_support", (step) => step.subflow(support, { returnTo: null }))
-  .build();
+  if (!decision.object.componentId) return null;
+
+  return {
+    id: decision.object.componentId,
+    input: decision.object.input,
+  };
+}
 ```
 
-After the handoff, the chat's `flow` field is updated to the child flow id, so the next `worker.run(...)` call continues inside that routed flow.
+That includes `help`: if your resolver intentionally chooses the visible help component, the runtime treats it like any other resolved component.
 
-### 6. Understand the message lifecycle
+## Navigation Helpers
 
-For each `worker.run(chatId, payload)` call, the worker does this in order:
-
-- loads the persisted chat from your repository
-- parses the incoming payload with `parseMessage`
-- creates helpers for the specific chat and message
-- tries matching global intents
-- tries matching step intents
-- tries matching step answer routes
-- runs the step `otherwise(...)`, then the flow `otherwise(...)`
-- persists the updated flow snapshot and chat fields back through `updateChat`
-
-This ordering is useful when you are deciding whether something should be modeled as an intent, an answer matcher, or a fallback.
-
-## Builder API
-
-### Flow
-
-- `chat.flow(id)`
-- `start(configure)`
-- `step(id, configure)`
-- `branch(id, options, configure)`
-- `globalIntent(intentId, actionOrTarget, options?)`
-- `otherwise(action)`
-- `build()`
-
-`chat.flow(id)` is pure. It returns a builder, and `.build()` returns a `DefinedFlow` value with no registration side effects.
-
-### Step
-
-- `canEnter(guard)`
-- `prompt(action)`
-- `effect(effect)`
-- `onExit(effect)`
-- `onIntent(intentId, actionOrTarget, options?)`
-- `onAnswer(matcher, paramsOrAction, actionMaybe?, options?)`
-- `otherwise(action)`
-- `end()`
-
-## Guards, actions, and side effects
-
-Use them with different responsibilities:
-
-- `guard`: decide whether the transition or step is allowed
-- `action`: mutate data and navigate
-- `effect`: perform side effects like sending messages, logging, analytics, webhooks, cache writes
-
-Good rule of thumb:
-
-- use `effect(...)` for things that should happen
-- use `prompt(...)` when the step actively speaks to the user and may redirect
-- use transition `effects` for route-scoped side effects
-- use `canEnter(...)` or route `guard` for constraints
-
-You can register reusable behavior once and reference it through returned handles:
-
-- `const hasName = chat.guard("hasName", fn)`
-- `const saveLead = chat.action("saveLead", fn)`
-- `const notifyOps = chat.effect("notifyOps", fn)`
-- `const email = chat.matcher("email", fn)`
-
-This keeps large flows readable without magic strings.
-
-## Branches and global intents
-
-Branches let you model flows like registration, checkout, onboarding, and claim flows.
-
-Useful branch controls:
-
-- `allowExternalIntents: false`: blocks non-`always` global intents while inside the branch
-- `canExit(...)`: prevents leaving a branch unless the branch allows it
-
-Useful global-intent policies:
-
-- `respectBranch`: works unless the branch blocks external intents
-- `always`: always available, even inside locked branches
-
-This is useful for things like:
-
-- `support`
-- `cancel`
-- `restart`
-- `speak_to_human`
-
-## Subflows
-
-Subflows let one flow enter another flow cleanly.
-
-- use `step.subflow(childFlow, { returnTo })`
-- the parent flow is pushed onto `flow_stack`
-- when the child flow ends, the worker resumes the parent flow on the configured return step
-
-This is useful for:
-
-- auth inside checkout
-- support handoff from anywhere
-- reusable registration or verification flows
-- nested onboarding sequences
-
-## XState integration
-
-`hobonos` uses XState internally to represent the active flow machine.
-
-That gives you:
-
-- explicit state transitions
-- durable snapshots via `flow_snapshot`
-- rehydration between messages
-- a cleaner foundation for more advanced orchestration over time
-
-You still author flows with the `hobonos` flow DSL rather than raw XState config.
-
-## Runtime API
-
-- `chat.createWorker(flows)` creates a worker from explicit flow definitions
-- `worker.run(chatId, payload)` processes a new incoming message
-- `worker.flows()` returns the worker's flow definitions
-
-## Current scope
-
-The package is optimized for chat-driven products, not generic workflow automation.
-
-It is especially useful when you want to build:
-
-- onboarding through messages
-- guided checkouts
-- registration and verification flows
-- support funnels
-- chat-driven website navigation
-
-## Status
-
-The API is evolving toward stronger support for:
-
-- richer named guards and actions
-- more explicit side-effect orchestration
-- reusable matcher and policy libraries
-- more advanced flow composition
+- `navigate(routeHandle)` changes routes and clears focus
+- `focus(component.handle)` enters a focused component manually
+- `unfocus()` clears the current focused interaction without navigating
+- breadcrumbs are available to `back`

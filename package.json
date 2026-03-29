@@ -4,7 +4,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "files": [
     "dist"
@@ -35,8 +35,5 @@
     "tsx": "^4.19.3",
     "typescript": "^6.0.2",
     "vitest": "^4.1.1"
-  },
-  "dependencies": {
-    "xstate": "^5.28.0"
   }
 }
