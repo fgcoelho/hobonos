@@ -108,6 +108,200 @@ describe("hobonos runtime", () => {
     );
   });
 
+  it("runs the entry proxy on first boot before rendering the route", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const pricing = hobonos.route("pricing", {
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Pricing page");
+        },
+      }),
+    });
+
+    const root = hobonos.rootRoute({
+      routes: [pricing],
+      proxy: ({ navigate, targetRoute }) => {
+        if (targetRoute.id === "/") {
+          navigate(pricing);
+        }
+      },
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Home");
+        },
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await worker.run("chat_1", { text: "hi" });
+
+    expect(getChat().currentRouteId).toBe("/pricing");
+    expect(getChat().storage.transcript).toEqual(["Pricing page"]);
+    expect(getChat().history?.map((entry) => entry.reason)).toEqual(["render"]);
+  });
+
+  it("inherits the nearest ancestor proxy when entering a child route", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const support = hobonos.route("support", {
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Support page");
+        },
+      }),
+    });
+
+    const billing = hobonos.route("billing", {
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Billing page");
+        },
+      }),
+    });
+
+    const account = hobonos.route("account", {
+      routes: [billing],
+      proxy: async ({ ctx, navigate }) => {
+        await ctx.mark("account proxy");
+        navigate(support);
+      },
+      page: hobonos.page({ components: [] }),
+    });
+
+    const root = hobonos.rootRoute({
+      routes: [account, support],
+      page: hobonos.page({
+        components: [
+          hobonos.button("billing", {
+            label: "Billing",
+            onInteract: ({ navigate }) => {
+              navigate(billing);
+            },
+          }),
+        ],
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await bootWorker(worker);
+    await worker.run("chat_1", { text: "billing" });
+
+    expect(getChat().currentRouteId).toBe("/support");
+    expect(getChat().storage.calls).toEqual(["account proxy"]);
+    expect(getChat().storage.transcript).toEqual(["Support page"]);
+  });
+
+  it("lets a child route proxy override an ancestor proxy", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const support = hobonos.route("support", {
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Support page");
+        },
+      }),
+    });
+
+    const done = hobonos.route("done", {
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Done page");
+        },
+      }),
+    });
+
+    const billing = hobonos.route("billing", {
+      proxy: async ({ ctx, navigate }) => {
+        await ctx.mark("billing proxy");
+        navigate(done);
+      },
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Billing page");
+        },
+      }),
+    });
+
+    const account = hobonos.route("account", {
+      routes: [billing],
+      proxy: async ({ ctx, navigate }) => {
+        await ctx.mark("account proxy");
+        navigate(support);
+      },
+      page: hobonos.page({ components: [] }),
+    });
+
+    const root = hobonos.rootRoute({
+      routes: [account, support, done],
+      page: hobonos.page({
+        components: [
+          hobonos.button("billing", {
+            label: "Billing",
+            onInteract: ({ navigate }) => {
+              navigate(billing);
+            },
+          }),
+        ],
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await bootWorker(worker);
+    await worker.run("chat_1", { text: "billing" });
+
+    expect(getChat().currentRouteId).toBe("/done");
+    expect(getChat().storage.calls).toEqual(["billing proxy"]);
+    expect(getChat().storage.transcript).toEqual(["Done page"]);
+  });
+
+  it("uses route guards only when entering and can run side effects before denying", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const billing = hobonos.route("billing", {
+      guard: async ({ ctx, storage }) => {
+        if (!storage.email) {
+          await ctx.send("Share your email first.");
+          return false;
+        }
+
+        return true;
+      },
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Billing page");
+        },
+      }),
+    });
+
+    const root = hobonos.rootRoute({
+      routes: [billing],
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Home");
+        },
+        components: [
+          hobonos.button("billing", {
+            label: "Billing",
+            onInteract: ({ navigate }) => {
+              navigate(billing);
+            },
+          }),
+        ],
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await bootWorker(worker);
+    await worker.run("chat_1", { text: "billing" });
+
+    expect(getChat().currentRouteId).toBe("/");
+    expect(getChat().storage.transcript).toEqual([
+      "Home",
+      "Share your email first.",
+    ]);
+  });
+
   it("runs page.render on navigation", async () => {
     const { hobonos, getChat } = createHarness();
 
@@ -220,6 +414,127 @@ describe("hobonos runtime", () => {
     expect(getChat().currentRouteId).toBe("/done");
     expect(getChat().storage).toMatchObject({ email: "register" });
     expect(getChat().storage.transcript).toEqual(["Done"]);
+  });
+
+  it("treats navigate as terminal inside handlers", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const done = hobonos.route("done", {
+      page: hobonos.page({
+        render: async ({ ctx }) => {
+          await ctx.send("Done");
+        },
+      }),
+    });
+
+    const root = hobonos.rootRoute({
+      routes: [done],
+      page: hobonos.page({
+        components: [
+          hobonos.button("next", {
+            label: "Next",
+            onInteract: ({ navigate, storage }) => {
+              storage.calls.push("before navigate");
+              navigate(done);
+              storage.calls.push("after navigate");
+            },
+          }),
+        ],
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await bootWorker(worker);
+    await worker.run("chat_1", { text: "next" });
+
+    expect(getChat().currentRouteId).toBe("/done");
+    expect(getChat().storage.calls).toEqual(["before navigate"]);
+    expect(getChat().storage.transcript).toEqual(["Done"]);
+  });
+
+  it("treats focus and unfocus as terminal inside handlers", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const email = hobonos.input("email", {
+      label: "Email",
+      render: async ({ ctx }) => {
+        await ctx.send("Share your email");
+      },
+      onInteract: ({ unfocus, storage }) => {
+        storage.calls.push("before unfocus");
+        unfocus();
+        storage.calls.push("after unfocus");
+      },
+    });
+
+    const root = hobonos.rootRoute({
+      page: hobonos.page({
+        components: [
+          email,
+          hobonos.button("start", {
+            label: "Start",
+            onInteract: ({ focus, storage }) => {
+              storage.calls.push("before focus");
+              focus({ kind: "component", id: "/:email", routeId: "/" });
+              storage.calls.push("after focus");
+            },
+          }),
+        ],
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await bootWorker(worker);
+    await worker.run("chat_1", { text: "start" });
+
+    expect(getChat().focusedComponentId).toBe("/:email");
+    expect(getChat().storage.calls).toEqual(["before focus"]);
+    expect(getChat().storage.transcript).toEqual(["Share your email"]);
+
+    await worker.run("chat_1", { text: "anything" });
+
+    expect(getChat().focusedComponentId).toBeNull();
+    expect(getChat().storage.calls).toEqual(["before focus", "before unfocus"]);
+  });
+
+  it("persists navigation when target render throws", async () => {
+    const { hobonos, getChat } = createHarness();
+
+    const broken = hobonos.route("broken", {
+      page: hobonos.page({
+        render: async () => {
+          throw new Error("broken render");
+        },
+      }),
+    });
+
+    const root = hobonos.rootRoute({
+      routes: [broken],
+      page: hobonos.page({
+        components: [
+          hobonos.button("broken", {
+            label: "Broken",
+            onInteract: ({ navigate }) => {
+              navigate(broken);
+            },
+          }),
+        ],
+      }),
+    });
+
+    const worker = hobonos.createWorker(root);
+    await bootWorker(worker);
+
+    await expect(worker.run("chat_1", { text: "broken" })).rejects.toThrow(
+      "broken render",
+    );
+
+    expect(getChat().currentRouteId).toBe("/broken");
+    expect(getChat().history?.map((entry) => entry.reason)).toEqual([
+      "render",
+      "interact",
+      "navigate",
+    ]);
   });
 
   it("supports direct input resolution without extra focus step", async () => {
@@ -367,10 +682,7 @@ describe("hobonos runtime", () => {
     expect(getChat().focusedComponentId).toBeNull();
     expect(getChat().focusUntil).toBeNull();
     expect(getChat().currentRouteId).toBe("/");
-    expect(getChat().storage.transcript).toEqual([
-      "What is your email?",
-      "Cancelled",
-    ]);
+    expect(getChat().storage.transcript).toEqual(["What is your email?"]);
   });
 
   it("supports back with render and onInteract", async () => {

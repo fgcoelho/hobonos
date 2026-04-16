@@ -28,6 +28,7 @@ import {
   resolveFocusedComponent,
 } from "../runtime/focus";
 import {
+  applyControllerEffects,
   runBack,
   runButton,
   runFocusedBack,
@@ -35,13 +36,16 @@ import {
   runFocusedInquiry,
   runHelp,
   runInput,
-  runMiddlewares,
   runNotFound,
   runResolvedHelp,
   runText,
   toVisibleComponents,
 } from "../runtime/handlers";
-import { renderRoute } from "../runtime/navigation";
+import {
+  canEnterRoute,
+  renderRoute,
+  resolveRouteProxy,
+} from "../runtime/navigation";
 import {
   collectRoutes,
   composeRoutes,
@@ -147,7 +151,12 @@ const createRouteRecord = <
     parentId: null,
     layout: options?.layout,
     page: options?.page,
-    middlewares: options?.middleware ?? [],
+    proxy: options?.proxy,
+    guards: options?.guard
+      ? Array.isArray(options.guard)
+        ? options.guard
+        : [options.guard]
+      : [],
     notFound: options?.notFound,
     children: options?.routes ?? [],
   };
@@ -332,178 +341,163 @@ const createApi = <
               set: Reflect.set,
             }) as Chat,
           );
-          clearExpiredFocus(chat);
-          const message = input.config.parseMessage(payload);
-          const ctx = {} as Ctx;
-          for (const middleware of input.middlewares) {
-            mergeMiddlewareResult(
-              ctx,
-              await middleware({ chat, message, ctx }),
-            );
-          }
 
-          const requestedRouteId = chat.currentRouteId ?? composed.root.id;
-          let currentRoute = routesById.get(requestedRouteId);
-          let routeMissing = false;
-          if (!currentRoute) {
-            routeMissing = true;
-            const fallbackIds = getFallbackRouteIds(requestedRouteId);
-            for (const fallbackRouteId of fallbackIds) {
-              currentRoute = routesById.get(fallbackRouteId);
-              if (currentRoute) {
-                break;
+          try {
+            clearExpiredFocus(chat);
+            const message = input.config.parseMessage(payload);
+            const ctx = {} as Ctx;
+            for (const middleware of input.middlewares) {
+              mergeMiddlewareResult(
+                ctx,
+                await middleware({ chat, message, ctx }),
+              );
+            }
+
+            const requestedRouteId = chat.currentRouteId ?? composed.root.id;
+            let currentRoute = routesById.get(requestedRouteId);
+            let routeMissing = false;
+            let enteredRoute = false;
+            if (!currentRoute) {
+              routeMissing = true;
+              const fallbackIds = getFallbackRouteIds(requestedRouteId);
+              for (const fallbackRouteId of fallbackIds) {
+                const candidateRoute = routesById.get(fallbackRouteId);
+                if (!candidateRoute) {
+                  continue;
+                }
+
+                const allowed = await canEnterRoute({
+                  route: candidateRoute,
+                  chat,
+                  message,
+                  ctx,
+                  routesById,
+                });
+                if (allowed) {
+                  currentRoute = candidateRoute;
+                  break;
+                }
+              }
+
+              if (!currentRoute) {
+                const rootAllowed = await canEnterRoute({
+                  route: composed.root,
+                  chat,
+                  message,
+                  ctx,
+                  routesById,
+                });
+                if (!rootAllowed) {
+                  throw new Error("Root route guard denied entry to '/'");
+                }
+
+                currentRoute = composed.root;
+              }
+
+              chat.currentRouteId = currentRoute.id;
+              enteredRoute = true;
+            } else if (!chat.currentRouteId) {
+              const rootAllowed = await canEnterRoute({
+                route: currentRoute,
+                chat,
+                message,
+                ctx,
+                routesById,
+              });
+              if (!rootAllowed) {
+                throw new Error("Root route guard denied entry to '/'");
+              }
+
+              chat.currentRouteId = currentRoute.id;
+              enteredRoute = true;
+            }
+
+            const isFirstMessage = (chat.history?.length ?? 0) === 0;
+
+            if (enteredRoute) {
+              const proxyResult = await resolveRouteProxy({
+                route: currentRoute,
+                chat,
+                message,
+                ctx,
+                routesById,
+              });
+
+              if (proxyResult.handled) {
+                await applyControllerEffects({
+                  chat,
+                  message,
+                  ctx,
+                  route: currentRoute,
+                  currentPage: proxyResult.targetPage,
+                  routeStack: proxyResult.routeStack,
+                  routesById,
+                  controller: proxyResult.controller,
+                  navigationReason: routeMissing ? "notFound" : "render",
+                  sourceRoute: currentRoute,
+                  defaultFocusDuration: input.config.defaultFocusDuration,
+                });
+
+                await input.config.repository.updateChat(chat);
+                return;
               }
             }
-            currentRoute ??= composed.root;
-            chat.currentRouteId = currentRoute.id;
-          } else if (!chat.currentRouteId) {
-            chat.currentRouteId = currentRoute.id;
-          }
 
-          const isFirstMessage = (chat.history?.length ?? 0) === 0;
+            if (isFirstMessage && !routeMissing) {
+              await renderRoute({
+                route: currentRoute,
+                chat,
+                message,
+                ctx,
+                routesById,
+              });
+              recordHistory({
+                chat,
+                routeId: currentRoute.id,
+                reason: "render",
+              });
 
-          if (isFirstMessage && !routeMissing) {
-            await renderRoute({
+              await input.config.repository.updateChat(chat);
+              return;
+            }
+
+            const routeStack = getRouteStack({
               route: currentRoute,
-              chat,
-              message,
-              ctx,
               routesById,
             });
-            recordHistory({ chat, routeId: currentRoute.id, reason: "render" });
-
-            await input.config.repository.updateChat(chat);
-            return;
-          }
-
-          const routeStack = getRouteStack({ route: currentRoute, routesById });
-          const layouts = getRouteLayouts({ routeStack });
-          const currentPage = getRoutePage({ route: currentRoute });
-          const components = toVisibleComponents({
-            layouts,
-            page: currentPage,
-          });
-
-          let routeNotFoundHandled = false;
-          if (routeMissing) {
-            routeNotFoundHandled = await runNotFound({
-              routeStack,
-              currentRoute,
-              components,
-              chat,
-              message,
-              ctx,
-              routesById,
-              defaultFocusDuration: input.config.defaultFocusDuration,
+            const layouts = getRouteLayouts({ routeStack });
+            const currentPage = getRoutePage({ route: currentRoute });
+            const components = toVisibleComponents({
+              layouts,
+              page: currentPage,
             });
-          }
-          const middlewareHandled = routeNotFoundHandled
-            ? true
-            : await runMiddlewares({
+
+            let routeNotFoundHandled = false;
+            if (routeMissing) {
+              routeNotFoundHandled = await runNotFound({
                 routeStack,
                 currentRoute,
-                currentPage,
+                components,
                 chat,
                 message,
                 ctx,
                 routesById,
                 defaultFocusDuration: input.config.defaultFocusDuration,
               });
-
-          if (!middlewareHandled) {
-            const focused = resolveFocusedComponent({
-              chat,
-              currentRoute,
-              currentPage,
-              routeStack,
-            });
-            if (chat.focusedComponentId && !focused) {
-              clearFocusState(chat);
-              await runHelp({
-                route: currentRoute,
-                layouts,
+            }
+            if (!routeNotFoundHandled) {
+              const focused = resolveFocusedComponent({
+                chat,
+                currentRoute,
                 currentPage,
-                components,
-                chat,
-                message,
-                ctx,
                 routeStack,
-                routesById,
-                defaultFocusDuration: input.config.defaultFocusDuration,
               });
-            } else if (focused) {
-              if (focused.component.kind === "input") {
-                await runFocusedInput({
+              if (chat.focusedComponentId && !focused) {
+                clearFocusState(chat);
+                await runHelp({
                   route: currentRoute,
+                  layouts,
                   currentPage,
-                  component: focused.component as any,
-                  chat,
-                  message,
-                  ctx,
-                  routeStack,
-                  routesById,
-                  defaultFocusDuration: input.config.defaultFocusDuration,
-                });
-              } else if (focused.component.kind === "inquiry") {
-                await runFocusedInquiry({
-                  route: currentRoute,
-                  currentPage,
-                  inquiry: focused.component as any,
-                  chat,
-                  message,
-                  ctx,
-                  routeStack,
-                  routesById,
-                  defaultFocusDuration: input.config.defaultFocusDuration,
-                });
-              } else if (focused.component.kind === "back") {
-                await runFocusedBack({
-                  route: currentRoute,
-                  currentPage,
-                  component: focused.component as any,
-                  chat,
-                  message,
-                  ctx,
-                  routeStack,
-                  routesById,
-                  defaultFocusDuration: input.config.defaultFocusDuration,
-                });
-              }
-            } else {
-              const resolvedComponent = await input.config.resolveComponent({
-                chat,
-                message,
-                ctx,
-                route: currentRoute,
-                routeStack,
-                components,
-              });
-              const matchedComponentId =
-                toResolvedComponentId(resolvedComponent);
-              const matchedInput = toResolvedInput(resolvedComponent);
-
-              const text = components.find(
-                (entry) =>
-                  entry.kind === "text" && entry.id === matchedComponentId,
-              );
-              const help = components.find(
-                (entry) =>
-                  entry.kind === "help" && entry.id === matchedComponentId,
-              );
-              const button = components.find(
-                (entry) =>
-                  entry.kind === "button" && entry.id === matchedComponentId,
-              );
-              const back = components.find(
-                (entry) =>
-                  entry.kind === "back" && entry.id === matchedComponentId,
-              );
-
-              if (help?.kind === "help") {
-                await runResolvedHelp({
-                  route: currentRoute,
-                  currentPage,
-                  component: help as any,
                   components,
                   chat,
                   message,
@@ -512,83 +506,36 @@ const createApi = <
                   routesById,
                   defaultFocusDuration: input.config.defaultFocusDuration,
                 });
-              } else if (text?.kind === "text") {
-                await runText({
-                  route: currentRoute,
-                  currentPage,
-                  text: text as any,
-                  chat,
-                  message,
-                  ctx,
-                  routeStack,
-                  routesById,
-                  defaultFocusDuration: input.config.defaultFocusDuration,
-                });
-              } else if (button?.kind === "button") {
-                await runButton({
-                  route: currentRoute,
-                  currentPage,
-                  button: button as any,
-                  chat,
-                  message,
-                  ctx,
-                  routeStack,
-                  routesById,
-                  defaultFocusDuration: input.config.defaultFocusDuration,
-                });
-              } else if (back?.kind === "back") {
-                await runBack({
-                  route: currentRoute,
-                  currentPage,
-                  back: back as any,
-                  chat,
-                  message,
-                  ctx,
-                  routeStack,
-                  routesById,
-                });
-              } else {
-                const interactive = components.find(
-                  (entry) =>
-                    (entry.kind === "input" || entry.kind === "inquiry") &&
-                    entry.id === matchedComponentId,
-                );
-
-                if (
-                  interactive?.kind === "input" &&
-                  typeof matchedInput === "string"
-                ) {
-                  await runInput({
+              } else if (focused) {
+                if (focused.component.kind === "input") {
+                  await runFocusedInput({
                     route: currentRoute,
                     currentPage,
-                    component: interactive as any,
+                    component: focused.component as any,
                     chat,
                     message,
                     ctx,
                     routeStack,
                     routesById,
-                    value: matchedInput,
                     defaultFocusDuration: input.config.defaultFocusDuration,
                   });
-                } else if (interactive) {
-                  await focusComponent({
+                } else if (focused.component.kind === "inquiry") {
+                  await runFocusedInquiry({
+                    route: currentRoute,
+                    currentPage,
+                    inquiry: focused.component as any,
                     chat,
                     message,
                     ctx,
-                    currentRoute,
-                    currentPage,
                     routeStack,
-                    componentId: interactive.id,
                     routesById,
-                    reason: "focus",
                     defaultFocusDuration: input.config.defaultFocusDuration,
                   });
-                } else {
-                  await runHelp({
+                } else if (focused.component.kind === "back") {
+                  await runFocusedBack({
                     route: currentRoute,
-                    layouts,
                     currentPage,
-                    components,
+                    component: focused.component as any,
                     chat,
                     message,
                     ctx,
@@ -597,11 +544,143 @@ const createApi = <
                     defaultFocusDuration: input.config.defaultFocusDuration,
                   });
                 }
+              } else {
+                const resolvedComponent = await input.config.resolveComponent({
+                  chat,
+                  message,
+                  ctx,
+                  route: currentRoute,
+                  routeStack,
+                  components,
+                });
+                const matchedComponentId =
+                  toResolvedComponentId(resolvedComponent);
+                const matchedInput = toResolvedInput(resolvedComponent);
+
+                const text = components.find(
+                  (entry) =>
+                    entry.kind === "text" && entry.id === matchedComponentId,
+                );
+                const help = components.find(
+                  (entry) =>
+                    entry.kind === "help" && entry.id === matchedComponentId,
+                );
+                const button = components.find(
+                  (entry) =>
+                    entry.kind === "button" && entry.id === matchedComponentId,
+                );
+                const back = components.find(
+                  (entry) =>
+                    entry.kind === "back" && entry.id === matchedComponentId,
+                );
+
+                if (help?.kind === "help") {
+                  await runResolvedHelp({
+                    route: currentRoute,
+                    currentPage,
+                    component: help as any,
+                    components,
+                    chat,
+                    message,
+                    ctx,
+                    routeStack,
+                    routesById,
+                    defaultFocusDuration: input.config.defaultFocusDuration,
+                  });
+                } else if (text?.kind === "text") {
+                  await runText({
+                    route: currentRoute,
+                    currentPage,
+                    text: text as any,
+                    chat,
+                    message,
+                    ctx,
+                    routeStack,
+                    routesById,
+                    defaultFocusDuration: input.config.defaultFocusDuration,
+                  });
+                } else if (button?.kind === "button") {
+                  await runButton({
+                    route: currentRoute,
+                    currentPage,
+                    button: button as any,
+                    chat,
+                    message,
+                    ctx,
+                    routeStack,
+                    routesById,
+                    defaultFocusDuration: input.config.defaultFocusDuration,
+                  });
+                } else if (back?.kind === "back") {
+                  await runBack({
+                    route: currentRoute,
+                    currentPage,
+                    back: back as any,
+                    chat,
+                    message,
+                    ctx,
+                    routeStack,
+                    routesById,
+                  });
+                } else {
+                  const interactive = components.find(
+                    (entry) =>
+                      (entry.kind === "input" || entry.kind === "inquiry") &&
+                      entry.id === matchedComponentId,
+                  );
+
+                  if (
+                    interactive?.kind === "input" &&
+                    typeof matchedInput === "string"
+                  ) {
+                    await runInput({
+                      route: currentRoute,
+                      currentPage,
+                      component: interactive as any,
+                      chat,
+                      message,
+                      ctx,
+                      routeStack,
+                      routesById,
+                      value: matchedInput,
+                      defaultFocusDuration: input.config.defaultFocusDuration,
+                    });
+                  } else if (interactive) {
+                    await focusComponent({
+                      chat,
+                      message,
+                      ctx,
+                      currentRoute,
+                      currentPage,
+                      routeStack,
+                      componentId: interactive.id,
+                      routesById,
+                      reason: "focus",
+                      defaultFocusDuration: input.config.defaultFocusDuration,
+                    });
+                  } else {
+                    await runHelp({
+                      route: currentRoute,
+                      layouts,
+                      currentPage,
+                      components,
+                      chat,
+                      message,
+                      ctx,
+                      routeStack,
+                      routesById,
+                      defaultFocusDuration: input.config.defaultFocusDuration,
+                    });
+                  }
+                }
               }
             }
-          }
 
-          await input.config.repository.updateChat(chat);
+            await input.config.repository.updateChat(chat);
+          } catch (error) {
+            await input.config.repository.updateChat(chat);
+            throw error;
+          }
         },
       };
     },

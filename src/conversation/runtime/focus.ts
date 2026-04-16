@@ -150,6 +150,8 @@ export const focusComponent = async <
       message: input.message,
       ctx: input.ctx,
       routeStack: input.routeStack,
+      routesById: input.routesById,
+      defaultFocusDuration: input.defaultFocusDuration,
     });
   }
 };

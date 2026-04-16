@@ -3,13 +3,7 @@ import type { Promisable } from "../../shared/promisable";
 export type HistoryEntry = {
   routeId: string;
   at: number;
-  reason:
-    | "render"
-    | "interact"
-    | "focus"
-    | "navigate"
-    | "middleware"
-    | "notFound";
+  reason: "render" | "interact" | "focus" | "navigate" | "notFound";
   sourceRouteId?: string;
   componentId?: string;
 };

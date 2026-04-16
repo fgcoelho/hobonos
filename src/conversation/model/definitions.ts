@@ -90,11 +90,44 @@ export type AppRuntimeBaseContext<
   unfocus: () => void;
 };
 
-export type AppMiddleware<
+export type AppRouteGuardContext<
   Chat extends IChat,
   Message,
   Ctx extends Record<string, any>,
-> = (ctx: AppRuntimeBaseContext<Chat, Message, Ctx>) => Promisable<void>;
+> = {
+  chat: Chat;
+  message: Message;
+  ctx: Ctx;
+  storage: Chat["storage"];
+  guardRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetPage?: ResolvedPageDefinition<Chat, Message, Ctx>;
+  sourceRoute?: DefinedRoute<Chat, Message, Ctx>;
+  routeStack: DefinedRoute<Chat, Message, Ctx>[];
+};
+
+export type AppRouteGuard<
+  Chat extends IChat,
+  Message,
+  Ctx extends Record<string, any>,
+> = (ctx: AppRouteGuardContext<Chat, Message, Ctx>) => Promisable<boolean>;
+
+export type AppRouteProxyContext<
+  Chat extends IChat,
+  Message,
+  Ctx extends Record<string, any>,
+> = AppRuntimeBaseContext<Chat, Message, Ctx> & {
+  proxyRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetPage?: ResolvedPageDefinition<Chat, Message, Ctx>;
+  sourceRoute?: DefinedRoute<Chat, Message, Ctx>;
+};
+
+export type AppRouteProxy<
+  Chat extends IChat,
+  Message,
+  Ctx extends Record<string, any>,
+> = (ctx: AppRouteProxyContext<Chat, Message, Ctx>) => Promisable<void>;
 
 export type AppPageRenderHandler<
   Chat extends IChat,
@@ -494,7 +527,8 @@ export type DefinedRoute<
   page?:
     | PageSource<Chat, Message, Ctx>
     | ResolvedPageDefinition<Chat, Message, Ctx>;
-  middlewares: AppMiddleware<Chat, Message, Ctx>[];
+  guards: AppRouteGuard<Chat, Message, Ctx>[];
+  proxy?: AppRouteProxy<Chat, Message, Ctx>;
   notFound?:
     | PageSource<Chat, Message, Ctx>
     | ResolvedPageDefinition<Chat, Message, Ctx>;
@@ -516,7 +550,10 @@ export type RouteOptions<
 > = {
   layout?: LayoutSource<Chat, Message, Ctx>;
   page?: PageSource<Chat, Message, Ctx>;
-  middleware?: AppMiddleware<Chat, Message, Ctx>[];
+  proxy?: AppRouteProxy<Chat, Message, Ctx>;
+  guard?:
+    | AppRouteGuard<Chat, Message, Ctx>
+    | AppRouteGuard<Chat, Message, Ctx>[];
   notFound?: PageSource<Chat, Message, Ctx>;
   routes?: DefinedRoute<Chat, Message, Ctx>[];
 };

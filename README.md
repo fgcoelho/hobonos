@@ -24,8 +24,8 @@ pnpm add hobonos
 
 - `createHobonos({ parseMessage, repository, resolveComponent, defaultFocusDuration? })`
 - `.middleware(async ({ chat, message, ctx }) => ({ ctx: { ... } }))`
-- `hobonos.route(name, { routes?, layout?, page?, middleware?, notFound? })`
-- `hobonos.rootRoute({ routes?, layout?, page?, middleware?, notFound? })`
+- `hobonos.route(name, { routes?, layout?, page?, guard?, notFound? })`
+- `hobonos.rootRoute({ routes?, layout?, page?, guard?, notFound? })`
 - `hobonos.layout({ render?, components? })`
 - `hobonos.page({ render?, components? })`
 - `hobonos.text(id, options)`
@@ -35,7 +35,7 @@ pnpm add hobonos
 - `hobonos.back(options)`
 - `hobonos.help({ render })`
 
-Route-local `middleware` and `notFound` are configured directly on `route(..., { ... })`.
+Route-local `guard` and `notFound` are configured directly on `route(..., { ... })`.
 
 Create workers with the branded app root only:
 
@@ -216,7 +216,27 @@ const hobonos = createHobonos({
   }));
 ```
 
-Everything returned in `ctx` is available in route middleware, page render handlers, and component handlers.
+Everything returned in `ctx` is available in route guards, page render handlers, and component handlers.
+
+## Route Guards
+
+Use `guard` to allow or deny entering a route. Guards run only when hobonos is about to enter a route, such as first boot or `navigate(...)`.
+
+They must return `true` or `false`. If a guard returns `false`, hobonos stays on the current route. You can send a message or run any other side effect before returning `false`.
+
+```ts
+const billing = hobonos.route("billing", {
+  guard: async ({ ctx, storage }) => {
+    if (!storage.email) {
+      await ctx.send("Share your email first.");
+      return false;
+    }
+
+    return true;
+  },
+  page: hobonos.page({ components: [] }),
+});
+```
 
 ## Component Guide
 

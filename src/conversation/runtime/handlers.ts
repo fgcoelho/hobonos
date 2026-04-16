@@ -9,6 +9,7 @@ import type {
   InputDefinition,
   InquiryDefinition,
   InquiryStep,
+  NavigationReason,
   PageComponent,
   ResolvedLayoutDefinition,
   ResolvedPageDefinition,
@@ -25,7 +26,7 @@ import {
   createInquirySubmitContext,
   createTextRenderContext,
 } from "./contexts";
-import { createController } from "./controller";
+import { createController, isRuntimeControlSignal } from "./controller";
 import { clearFocusState, focusComponent } from "./focus";
 import { commitNavigation } from "./navigation";
 import { getRouteLayouts } from "./routes";
@@ -80,6 +81,72 @@ const renderInquiryStep = async <
   );
 };
 
+export const applyControllerEffects = async <
+  Chat extends IChat,
+  Message,
+  Ctx extends Record<string, any>,
+>(input: {
+  chat: Chat;
+  message: Message;
+  ctx: Ctx;
+  route: DefinedRoute<Chat, Message, Ctx>;
+  currentPage?: ResolvedPageDefinition<Chat, Message, Ctx>;
+  routeStack: DefinedRoute<Chat, Message, Ctx>[];
+  routesById: Map<string, DefinedRoute<Chat, Message, Ctx>>;
+  controller: ReturnType<typeof createController>;
+  componentId?: string;
+  recordInteraction?: boolean;
+  clearFocus?: boolean;
+  navigationReason: NavigationReason;
+  sourceRoute?: DefinedRoute<Chat, Message, Ctx>;
+  defaultFocusDuration?: number;
+}) => {
+  const focusTarget = input.controller.focusTarget();
+  if (focusTarget) {
+    input.controller.clear();
+    await focusComponent({
+      chat: input.chat,
+      message: input.message,
+      ctx: input.ctx,
+      currentRoute: input.route,
+      currentPage: input.currentPage,
+      routeStack: input.routeStack,
+      componentId: focusTarget.id,
+      routesById: input.routesById,
+      reason: "focus",
+      defaultFocusDuration: input.defaultFocusDuration,
+    });
+    return true;
+  }
+
+  if (input.controller.shouldUnfocus() || (input.clearFocus ?? false)) {
+    clearFocusState(input.chat);
+  }
+
+  if (input.recordInteraction && input.componentId) {
+    recordHistory({
+      chat: input.chat,
+      routeId: input.route.id,
+      reason: "interact",
+      sourceRouteId: input.route.id,
+      componentId: input.componentId,
+    });
+  }
+
+  await commitNavigation({
+    targetRouteId: input.controller.routeId(),
+    reason: input.navigationReason,
+    chat: input.chat,
+    message: input.message,
+    ctx: input.ctx,
+    sourceRoute: input.sourceRoute ?? input.route,
+    routesById: input.routesById,
+    componentId: input.componentId,
+    defaultFocusDuration: input.defaultFocusDuration,
+  });
+  return true;
+};
+
 const renderHelp = async <
   Chat extends IChat,
   Message,
@@ -93,8 +160,9 @@ const renderHelp = async <
   message: Message;
   ctx: Ctx;
   routeStack: DefinedRoute<Chat, Message, Ctx>[];
+  controller?: ReturnType<typeof createController>;
 }) => {
-  const controller = createController();
+  const controller = input.controller ?? createController();
   await input.component.render({
     ...createBaseContext({
       chat: input.chat,
@@ -338,36 +406,37 @@ export const runHelp = async <
     return false;
   }
 
-  const controller = await renderHelp({
-    route: input.route,
-    currentPage: input.currentPage,
-    component: help,
-    components: input.components,
-    chat: input.chat,
-    message: input.message,
-    ctx: input.ctx,
-    routeStack: input.routeStack,
-  });
-
-  const focusTarget = controller.focusTarget();
-  if (focusTarget) {
-    controller.clear();
-    await focusComponent({
+  const controller = createController();
+  try {
+    await renderHelp({
+      route: input.route,
+      currentPage: input.currentPage,
+      component: help,
+      components: input.components,
       chat: input.chat,
       message: input.message,
       ctx: input.ctx,
-      currentRoute: input.route,
-      currentPage: input.currentPage,
       routeStack: input.routeStack,
-      componentId: focusTarget.id,
-      routesById: input.routesById,
-      reason: "focus",
-      defaultFocusDuration: input.defaultFocusDuration,
+      controller,
     });
-    return true;
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
-  return true;
+  return applyControllerEffects({
+    chat: input.chat,
+    message: input.message,
+    ctx: input.ctx,
+    route: input.route,
+    currentPage: input.currentPage,
+    routeStack: input.routeStack,
+    routesById: input.routesById,
+    controller,
+    navigationReason: "navigate",
+    defaultFocusDuration: input.defaultFocusDuration,
+  });
 };
 
 export const runResolvedHelp = async <
@@ -386,15 +455,29 @@ export const runResolvedHelp = async <
   routesById: Map<string, DefinedRoute<Chat, Message, Ctx>>;
   defaultFocusDuration?: number;
 }) => {
-  await renderHelp(input);
-  recordHistory({
+  const controller = createController();
+  try {
+    await renderHelp({ ...input, controller });
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
+  }
+
+  return applyControllerEffects({
     chat: input.chat,
-    routeId: input.route.id,
-    reason: "interact",
-    sourceRouteId: input.route.id,
+    message: input.message,
+    ctx: input.ctx,
+    route: input.route,
+    currentPage: input.currentPage,
+    routeStack: input.routeStack,
+    routesById: input.routesById,
+    controller,
     componentId: input.component.id,
+    recordInteraction: true,
+    navigationReason: "navigate",
+    defaultFocusDuration: input.defaultFocusDuration,
   });
-  return true;
 };
 
 const finalizeInteraction = async <
@@ -414,47 +497,12 @@ const finalizeInteraction = async <
   clearFocus?: boolean;
   defaultFocusDuration?: number;
 }) => {
-  const focusTarget = input.controller.focusTarget();
-  if (focusTarget) {
-    input.controller.clear();
-    await focusComponent({
-      chat: input.chat,
-      message: input.message,
-      ctx: input.ctx,
-      currentRoute: input.route,
-      currentPage: input.currentPage,
-      routeStack: input.routeStack,
-      componentId: focusTarget.id,
-      routesById: input.routesById,
-      reason: "focus",
-      defaultFocusDuration: input.defaultFocusDuration,
-    });
-    return true;
-  }
-
-  if (input.controller.shouldUnfocus() || (input.clearFocus ?? true)) {
-    clearFocusState(input.chat);
-  }
-
-  recordHistory({
-    chat: input.chat,
-    routeId: input.route.id,
-    reason: "interact",
-    sourceRouteId: input.route.id,
-    componentId: input.componentId,
+  return applyControllerEffects({
+    ...input,
+    recordInteraction: true,
+    clearFocus: input.clearFocus ?? true,
+    navigationReason: "navigate",
   });
-
-  await commitNavigation({
-    targetRouteId: input.controller.routeId(),
-    reason: "navigate",
-    chat: input.chat,
-    message: input.message,
-    ctx: input.ctx,
-    sourceRoute: input.route,
-    routesById: input.routesById,
-    componentId: input.componentId,
-  });
-  return true;
 };
 
 export const renderComponent = async <
@@ -474,87 +522,112 @@ export const renderComponent = async <
   message: Message;
   ctx: Ctx;
   routeStack: DefinedRoute<Chat, Message, Ctx>[];
+  routesById: Map<string, DefinedRoute<Chat, Message, Ctx>>;
+  defaultFocusDuration?: number;
 }) => {
   const controller = createController();
 
-  if (input.component.kind === "text") {
-    await renderText({ ...input, component: input.component, ...controller });
-    return;
-  }
-
-  if (input.component.kind === "help") {
-    const layouts = getRouteLayouts({ routeStack: input.routeStack });
-    await renderHelp({
-      route: input.route,
-      currentPage: input.currentPage,
-      component: input.component,
-      components: toVisibleComponents({ layouts, page: input.currentPage }),
-      chat: input.chat,
-      message: input.message,
-      ctx: input.ctx,
-      routeStack: input.routeStack,
-    });
-    return;
-  }
-
-  if (input.component.kind === "input" && input.component.render) {
-    await input.component.render(
-      createInputRenderContext({
-        component: input.component,
-        chat: input.chat,
-        message: input.message,
-        ctx: input.ctx,
-        currentRoute: input.route,
-        currentPage: input.currentPage,
-        routeStack: input.routeStack,
-        navigate: controller.navigate,
-        focus: controller.focus,
-        unfocus: controller.unfocus,
-      }),
-    );
-    return;
-  }
-
-  if (input.component.kind === "inquiry") {
-    const inquiryState = getInquiryState(input.chat, input.component.id);
-    const step = getInquiryStep(input.component, inquiryState?.stepIndex ?? 0);
-    if (!step) {
+  try {
+    if (input.component.kind === "text") {
+      await renderText({ ...input, component: input.component, ...controller });
       return;
     }
 
-    await renderInquiryStep({
-      inquiry: input.component,
-      step,
-      answers: inquiryState?.answers ?? {},
-      route: input.route,
-      currentPage: input.currentPage,
-      chat: input.chat,
-      message: input.message,
-      ctx: input.ctx,
-      routeStack: input.routeStack,
-      navigate: controller.navigate,
-      focus: controller.focus,
-      unfocus: controller.unfocus,
-    });
-    return;
-  }
-
-  if (input.component.kind === "back" && input.component.render) {
-    await input.component.render(
-      createBackRenderContext({
+    if (input.component.kind === "help") {
+      const layouts = getRouteLayouts({ routeStack: input.routeStack });
+      await renderHelp({
+        route: input.route,
+        currentPage: input.currentPage,
         component: input.component,
+        components: toVisibleComponents({ layouts, page: input.currentPage }),
         chat: input.chat,
         message: input.message,
         ctx: input.ctx,
-        currentRoute: input.route,
+        routeStack: input.routeStack,
+        controller,
+      });
+      return;
+    }
+
+    if (input.component.kind === "input" && input.component.render) {
+      await input.component.render(
+        createInputRenderContext({
+          component: input.component,
+          chat: input.chat,
+          message: input.message,
+          ctx: input.ctx,
+          currentRoute: input.route,
+          currentPage: input.currentPage,
+          routeStack: input.routeStack,
+          navigate: controller.navigate,
+          focus: controller.focus,
+          unfocus: controller.unfocus,
+        }),
+      );
+      return;
+    }
+
+    if (input.component.kind === "inquiry") {
+      const inquiryState = getInquiryState(input.chat, input.component.id);
+      const step = getInquiryStep(
+        input.component,
+        inquiryState?.stepIndex ?? 0,
+      );
+      if (!step) {
+        return;
+      }
+
+      await renderInquiryStep({
+        inquiry: input.component,
+        step,
+        answers: inquiryState?.answers ?? {},
+        route: input.route,
         currentPage: input.currentPage,
+        chat: input.chat,
+        message: input.message,
+        ctx: input.ctx,
         routeStack: input.routeStack,
         navigate: controller.navigate,
         focus: controller.focus,
         unfocus: controller.unfocus,
-      }),
-    );
+      });
+      return;
+    }
+
+    if (input.component.kind === "back" && input.component.render) {
+      await input.component.render(
+        createBackRenderContext({
+          component: input.component,
+          chat: input.chat,
+          message: input.message,
+          ctx: input.ctx,
+          currentRoute: input.route,
+          currentPage: input.currentPage,
+          routeStack: input.routeStack,
+          navigate: controller.navigate,
+          focus: controller.focus,
+          unfocus: controller.unfocus,
+        }),
+      );
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
+
+  await applyControllerEffects({
+    chat: input.chat,
+    message: input.message,
+    ctx: input.ctx,
+    route: input.route,
+    currentPage: input.currentPage,
+    routeStack: input.routeStack,
+    routesById: input.routesById,
+    controller,
+    navigationReason: "navigate",
+    defaultFocusDuration: input.defaultFocusDuration,
+  });
 };
 
 export const runText = async <
@@ -573,13 +646,19 @@ export const runText = async <
   defaultFocusDuration?: number;
 }) => {
   const controller = createController();
-  await renderText({
-    ...input,
-    component: input.text,
-    navigate: controller.navigate,
-    focus: controller.focus,
-    unfocus: controller.unfocus,
-  });
+  try {
+    await renderText({
+      ...input,
+      component: input.text,
+      navigate: controller.navigate,
+      focus: controller.focus,
+      unfocus: controller.unfocus,
+    });
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
+  }
   return finalizeInteraction({
     chat: input.chat,
     message: input.message,
@@ -610,21 +689,27 @@ export const runButton = async <
   defaultFocusDuration?: number;
 }) => {
   const controller = createController();
-  if (input.button.onInteract) {
-    await input.button.onInteract(
-      createButtonContext({
-        button: input.button,
-        chat: input.chat,
-        message: input.message,
-        ctx: input.ctx,
-        currentRoute: input.route,
-        currentPage: input.currentPage,
-        routeStack: input.routeStack,
-        navigate: controller.navigate,
-        focus: controller.focus,
-        unfocus: controller.unfocus,
-      }),
-    );
+  try {
+    if (input.button.onInteract) {
+      await input.button.onInteract(
+        createButtonContext({
+          button: input.button,
+          chat: input.chat,
+          message: input.message,
+          ctx: input.ctx,
+          currentRoute: input.route,
+          currentPage: input.currentPage,
+          routeStack: input.routeStack,
+          navigate: controller.navigate,
+          focus: controller.focus,
+          unfocus: controller.unfocus,
+        }),
+      );
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
   return finalizeInteraction({
@@ -686,10 +771,16 @@ export const runBack = async <
     unfocus: controller.unfocus,
   });
 
-  if (input.back.onInteract) {
-    await input.back.onInteract(context);
-  } else {
-    context.goBack();
+  try {
+    if (input.back.onInteract) {
+      await input.back.onInteract(context);
+    } else {
+      context.goBack();
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
   return finalizeInteraction({
@@ -704,81 +795,6 @@ export const runBack = async <
     componentId: input.back.id,
     defaultFocusDuration: input.defaultFocusDuration,
   });
-};
-
-export const runMiddlewares = async <
-  Chat extends IChat,
-  Message,
-  Ctx extends Record<string, any>,
->(input: {
-  routeStack: DefinedRoute<Chat, Message, Ctx>[];
-  currentRoute: DefinedRoute<Chat, Message, Ctx>;
-  currentPage?: ResolvedPageDefinition<Chat, Message, Ctx>;
-  chat: Chat;
-  message: Message;
-  ctx: Ctx;
-  routesById: Map<string, DefinedRoute<Chat, Message, Ctx>>;
-  defaultFocusDuration?: number;
-}) => {
-  const controller = createController();
-
-  for (const route of input.routeStack) {
-    for (const middleware of route.middlewares) {
-      await middleware(
-        createBaseContext({
-          chat: input.chat,
-          message: input.message,
-          ctx: input.ctx,
-          currentRoute: input.currentRoute,
-          currentPage: input.currentPage,
-          routeStack: input.routeStack,
-          navigate: controller.navigate,
-          focus: controller.focus,
-          unfocus: controller.unfocus,
-        }),
-      );
-
-      const focusTarget = controller.focusTarget();
-      if (focusTarget) {
-        controller.clear();
-        await focusComponent({
-          chat: input.chat,
-          message: input.message,
-          ctx: input.ctx,
-          currentRoute: input.currentRoute,
-          currentPage: input.currentPage,
-          routeStack: input.routeStack,
-          componentId: focusTarget.id,
-          routesById: input.routesById,
-          reason: "focus",
-          defaultFocusDuration: input.defaultFocusDuration,
-        });
-        return true;
-      }
-
-      if (controller.shouldUnfocus()) {
-        controller.clear();
-        clearFocusState(input.chat);
-      }
-
-      const nextRouteId = controller.routeId();
-      if (nextRouteId) {
-        controller.clear();
-        await commitNavigation({
-          targetRouteId: nextRouteId,
-          reason: "middleware",
-          chat: input.chat,
-          message: input.message,
-          ctx: input.ctx,
-          sourceRoute: input.currentRoute,
-          routesById: input.routesById,
-        });
-        return true;
-      }
-    }
-  }
-
-  return false;
 };
 
 export const runNotFound = async <
@@ -805,55 +821,42 @@ export const runNotFound = async <
     }
 
     const controller = createController();
-    if (notFoundPage.render) {
-      const context: AppNotFoundContext<Chat, Message, Ctx> = {
-        ...createBaseContext({
-          chat: input.chat,
-          message: input.message,
-          ctx: input.ctx,
-          currentRoute: input.currentRoute,
-          currentPage: notFoundPage,
-          routeStack: input.routeStack,
-          navigate: controller.navigate,
-          focus: controller.focus,
-          unfocus: controller.unfocus,
-        }),
-        components: input.components,
-      };
-      await notFoundPage.render(context);
+    try {
+      if (notFoundPage.render) {
+        const context: AppNotFoundContext<Chat, Message, Ctx> = {
+          ...createBaseContext({
+            chat: input.chat,
+            message: input.message,
+            ctx: input.ctx,
+            currentRoute: input.currentRoute,
+            currentPage: notFoundPage,
+            routeStack: input.routeStack,
+            navigate: controller.navigate,
+            focus: controller.focus,
+            unfocus: controller.unfocus,
+          }),
+          components: input.components,
+        };
+        await notFoundPage.render(context);
+      }
+    } catch (error) {
+      if (!isRuntimeControlSignal(error)) {
+        throw error;
+      }
     }
 
-    const focusTarget = controller.focusTarget();
-    if (focusTarget) {
-      controller.clear();
-      await focusComponent({
-        chat: input.chat,
-        message: input.message,
-        ctx: input.ctx,
-        currentRoute: input.currentRoute,
-        currentPage: notFoundPage,
-        routeStack: input.routeStack,
-        componentId: focusTarget.id,
-        routesById: input.routesById,
-        reason: "focus",
-        defaultFocusDuration: input.defaultFocusDuration,
-      });
-      return true;
-    }
-
-    if (controller.shouldUnfocus()) {
-      controller.clear();
-      clearFocusState(input.chat);
-    }
-
-    await commitNavigation({
-      targetRouteId: controller.routeId(),
-      reason: "notFound",
+    await applyControllerEffects({
       chat: input.chat,
       message: input.message,
       ctx: input.ctx,
-      sourceRoute: input.currentRoute,
+      route: input.currentRoute,
+      currentPage: notFoundPage,
+      routeStack: input.routeStack,
       routesById: input.routesById,
+      controller,
+      navigationReason: "notFound",
+      sourceRoute: input.currentRoute,
+      defaultFocusDuration: input.defaultFocusDuration,
     });
     return true;
   }
@@ -880,22 +883,28 @@ export const runFocusedInput = async <
   const rawInput =
     typeof input.message.text === "string" ? input.message.text : "";
 
-  if (input.component.onInteract) {
-    await input.component.onInteract(
-      createInputInteractContext({
-        component: input.component,
-        input: rawInput,
-        chat: input.chat,
-        message: input.message,
-        ctx: input.ctx,
-        currentRoute: input.route,
-        currentPage: input.currentPage,
-        routeStack: input.routeStack,
-        navigate: controller.navigate,
-        focus: controller.focus,
-        unfocus: controller.unfocus,
-      }),
-    );
+  try {
+    if (input.component.onInteract) {
+      await input.component.onInteract(
+        createInputInteractContext({
+          component: input.component,
+          input: rawInput,
+          chat: input.chat,
+          message: input.message,
+          ctx: input.ctx,
+          currentRoute: input.route,
+          currentPage: input.currentPage,
+          routeStack: input.routeStack,
+          navigate: controller.navigate,
+          focus: controller.focus,
+          unfocus: controller.unfocus,
+        }),
+      );
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
   return finalizeInteraction({
@@ -930,22 +939,28 @@ export const runInput = async <
 }) => {
   const controller = createController();
 
-  if (input.component.onInteract) {
-    await input.component.onInteract(
-      createInputInteractContext({
-        component: input.component,
-        input: input.value,
-        chat: input.chat,
-        message: input.message,
-        ctx: input.ctx,
-        currentRoute: input.route,
-        currentPage: input.currentPage,
-        routeStack: input.routeStack,
-        navigate: controller.navigate,
-        focus: controller.focus,
-        unfocus: controller.unfocus,
-      }),
-    );
+  try {
+    if (input.component.onInteract) {
+      await input.component.onInteract(
+        createInputInteractContext({
+          component: input.component,
+          input: input.value,
+          chat: input.chat,
+          message: input.message,
+          ctx: input.ctx,
+          currentRoute: input.route,
+          currentPage: input.currentPage,
+          routeStack: input.routeStack,
+          navigate: controller.navigate,
+          focus: controller.focus,
+          unfocus: controller.unfocus,
+        }),
+      );
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
   return finalizeInteraction({
@@ -992,47 +1007,74 @@ export const runFocusedInquiry = async <
   const nextStepIndex = stepIndex + 1;
   const nextStep = getInquiryStep(input.inquiry, nextStepIndex);
   if (nextStep) {
+    const controller = createController();
     setInquiryState(input.chat, input.inquiry.id, {
       routeId: input.route.id,
       inquiryId: input.inquiry.id,
       stepIndex: nextStepIndex,
       answers,
     });
-    await renderInquiryStep({
-      inquiry: input.inquiry,
-      step: nextStep,
-      answers,
-      route: input.route,
-      currentPage: input.currentPage,
+    try {
+      await renderInquiryStep({
+        inquiry: input.inquiry,
+        step: nextStep,
+        answers,
+        route: input.route,
+        currentPage: input.currentPage,
+        chat: input.chat,
+        message: input.message,
+        ctx: input.ctx,
+        routeStack: input.routeStack,
+        navigate: controller.navigate,
+        focus: controller.focus,
+        unfocus: controller.unfocus,
+      });
+    } catch (error) {
+      if (!isRuntimeControlSignal(error)) {
+        throw error;
+      }
+    }
+
+    await applyControllerEffects({
       chat: input.chat,
       message: input.message,
       ctx: input.ctx,
+      route: input.route,
+      currentPage: input.currentPage,
       routeStack: input.routeStack,
-      navigate: createController().navigate,
-      focus: createController().focus,
-      unfocus: createController().unfocus,
+      routesById: input.routesById,
+      controller,
+      componentId: input.inquiry.id,
+      navigationReason: "navigate",
+      defaultFocusDuration: input.defaultFocusDuration,
     });
     return true;
   }
 
   setInquiryState(input.chat, input.inquiry.id, null);
   const controller = createController();
-  if (input.inquiry.onSubmit) {
-    await input.inquiry.onSubmit(
-      createInquirySubmitContext({
-        inquiry: input.inquiry,
-        answers,
-        chat: input.chat,
-        message: input.message,
-        ctx: input.ctx,
-        currentRoute: input.route,
-        currentPage: input.currentPage,
-        routeStack: input.routeStack,
-        navigate: controller.navigate,
-        focus: controller.focus,
-        unfocus: controller.unfocus,
-      }),
-    );
+  try {
+    if (input.inquiry.onSubmit) {
+      await input.inquiry.onSubmit(
+        createInquirySubmitContext({
+          inquiry: input.inquiry,
+          answers,
+          chat: input.chat,
+          message: input.message,
+          ctx: input.ctx,
+          currentRoute: input.route,
+          currentPage: input.currentPage,
+          routeStack: input.routeStack,
+          navigate: controller.navigate,
+          focus: controller.focus,
+          unfocus: controller.unfocus,
+        }),
+      );
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
   return finalizeInteraction({
@@ -1078,10 +1120,16 @@ export const runFocusedBack = async <
     unfocus: controller.unfocus,
   });
 
-  if (input.component.onInteract) {
-    await input.component.onInteract(context);
-  } else {
-    context.goBack();
+  try {
+    if (input.component.onInteract) {
+      await input.component.onInteract(context);
+    } else {
+      context.goBack();
+    }
+  } catch (error) {
+    if (!isRuntimeControlSignal(error)) {
+      throw error;
+    }
   }
 
   return finalizeInteraction({

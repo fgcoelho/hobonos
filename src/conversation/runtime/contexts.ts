@@ -4,6 +4,8 @@ import type {
   AppButtonContext,
   AppInputInteractContext,
   AppInputRenderContext,
+  AppRouteGuardContext,
+  AppRouteProxyContext,
   AppRuntimeBaseContext,
   AppTextRenderContext,
   BackDefinition,
@@ -108,6 +110,65 @@ export const createBaseContext = <
   navigate: input.navigate,
   focus: input.focus,
   unfocus: input.unfocus,
+});
+
+export const createRouteGuardContext = <
+  Chat extends IChat,
+  Message,
+  Ctx extends Record<string, any>,
+>(input: {
+  chat: Chat;
+  message: Message;
+  ctx: Ctx;
+  guardRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetPage?: ResolvedPageDefinition<Chat, Message, Ctx>;
+  sourceRoute?: DefinedRoute<Chat, Message, Ctx>;
+  routeStack: DefinedRoute<Chat, Message, Ctx>[];
+}): AppRouteGuardContext<Chat, Message, Ctx> => ({
+  chat: input.chat,
+  message: input.message,
+  ctx: input.ctx,
+  storage: input.chat.storage,
+  guardRoute: input.guardRoute,
+  targetRoute: input.targetRoute,
+  targetPage: input.targetPage,
+  sourceRoute: input.sourceRoute,
+  routeStack: input.routeStack,
+});
+
+export const createRouteProxyContext = <
+  Chat extends IChat,
+  Message,
+  Ctx extends Record<string, any>,
+>(input: {
+  chat: Chat;
+  message: Message;
+  ctx: Ctx;
+  proxyRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetRoute: DefinedRoute<Chat, Message, Ctx>;
+  targetPage?: ResolvedPageDefinition<Chat, Message, Ctx>;
+  sourceRoute?: DefinedRoute<Chat, Message, Ctx>;
+  routeStack: DefinedRoute<Chat, Message, Ctx>[];
+  navigate: (route: RouteHandle) => void;
+  focus: (component: ComponentHandle) => void;
+  unfocus: () => void;
+}): AppRouteProxyContext<Chat, Message, Ctx> => ({
+  ...createBaseContext({
+    chat: input.chat,
+    message: input.message,
+    ctx: input.ctx,
+    currentRoute: input.targetRoute,
+    currentPage: input.targetPage,
+    routeStack: input.routeStack,
+    navigate: input.navigate,
+    focus: input.focus,
+    unfocus: input.unfocus,
+  }),
+  proxyRoute: input.proxyRoute,
+  targetRoute: input.targetRoute,
+  targetPage: input.targetPage,
+  sourceRoute: input.sourceRoute,
 });
 
 export const createTextRenderContext = <
